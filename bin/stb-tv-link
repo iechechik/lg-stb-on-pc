@@ -40,8 +40,11 @@ MANIFEST = os.path.join(STB_HOME, "tvctl/nuc_manifest.json")
 SOCK = stbconf.get("STB_TV_SOCK", "/run/stb/tv.sock")
 LOG = "/var/log/stb/tvdaemon.log"
 
-STATE = {"power": None, "sound": None, "app": None, "volume": None,
-         "muted": None, "updated": None}   # updated — когда телевизор подтвердил состояние
+STATE = {"power": None, "sound": None, "app": None, "volume": None, "muted": None,
+         # updated — когда телевизор подтвердил хоть что-то; по нему судить о
+         # конкретном поле нельзя, поэтому у каждого поля своя отметка.
+         "updated": None, "power_updated": None, "sound_updated": None,
+         "app_updated": None}
 _client = None
 _lock = asyncio.Lock()
 
@@ -55,24 +58,8 @@ def log(msg):
         pass
 
 
-# ---------------------------------------------------------------- события от ТВ
-async def on_power(payload):
-    STATE["power"] = (payload or {}).get("state")
-
-
-async def on_sound(payload):
-    STATE["sound"] = (payload or {}).get("soundOutput")
-
-
-async def on_app(payload):
-    STATE["app"] = (payload or {}).get("appId")
-
-
-async def on_volume(payload):
-    payload = payload or {}
-    STATE["volume"] = payload.get("volume")
-    STATE["muted"] = payload.get("muted")
-
+# Подписок на события нет (states=[] в connect): состояние берётся опросом,
+# поэтому обработчиков on_power/on_sound/on_app здесь намеренно нет.
 
 async def connect():
     """Новое соединение + подписки. Вызывается только под замком."""
@@ -113,8 +100,12 @@ async def ensure():
 
 
 # ---------------------------------------------------------------- команды
-COMMAND_TIMEOUT = 10.0   # секунд на одну команду целиком
-CONNECT_TIMEOUT = 8.0    # секунд на установление соединения
+PERIODIC_QUERY = 5        # запрос звука в периодическом обновлении
+PERIODIC_LOCK_WAIT = 2    # сколько ждём очереди, прежде чем пропустить тик
+# Бюджеты короче клиентских (8 с в lib/stbtv.py): демон должен успеть сказать
+# «не вышло» раньше, чем клиент решит, что демон мёртв, и полезет напрямую.
+COMMAND_TIMEOUT = 6.0    # секунд на одну команду целиком
+CONNECT_TIMEOUT = 5.0    # секунд на установление соединения
 
 
 def touch():
@@ -140,12 +131,15 @@ async def cmd_state(client):
         safe(client.get_sound_output()),
         safe(client.get_current_app()),
     )
+    now = time.time()
     fresh = False
     if isinstance(power, dict) and power.get("state"):
         STATE["power"] = power["state"]
+        STATE["power_updated"] = now
         fresh = True
     if isinstance(sound, str) and sound:
         STATE["sound"] = sound
+        STATE["sound_updated"] = now
         fresh = True
     if isinstance(app, str) and app:
         if STATE["app"] != app:
@@ -153,6 +147,7 @@ async def cmd_state(client):
             # эфир, браузер — всё, что не наш вход
             log("на экране телевизора: %s" % app)
         STATE["app"] = app
+        STATE["app_updated"] = now
         fresh = True
     if not fresh:
         # Ни один вопрос не получил ответа — соединение мертво, даже если
@@ -160,7 +155,12 @@ async def cmd_state(client):
         # нельзя: сторож по нему гасил экран и не поднимал обратно.
         raise ConnectionError("телевизор не ответил ни на один вопрос")
     touch()
-    return {"ok": True, "state": dict(STATE)}
+    # Возраст по каждому полю: ответ на один вопрос не делает свежими остальные.
+    ages = {}
+    for field in ("power", "sound", "app"):
+        stamp = STATE.get(field + "_updated")
+        ages[field] = None if not stamp else round(max(0.0, now - float(stamp)), 1)
+    return {"ok": True, "state": dict(STATE), "ages": ages}
 
 
 def as_bool(raw, default=False):
@@ -291,16 +291,55 @@ async def serve_conn(reader, writer):
             pass
 
 
+async def refresh_sound():
+    """Один тик: освежить звук, пока телевизор включён.
+
+    Запрос под замком, но с таймаутом: зависший телевизор не должен держать
+    очередь команд вечно. Клиент, на котором случилась ошибка, снимается с
+    `_client` под замком, а закрывается уже после его отпускания — иначе
+    другой обработчик успел бы взять закрываемое соединение.
+    """
+    global _client  # pylint: disable=global-statement
+    try:
+        await asyncio.wait_for(_lock.acquire(), timeout=PERIODIC_LOCK_WAIT)
+    except asyncio.TimeoutError:
+        log("периодическое обновление пропущено: демон занят")
+        return False
+    dropped = None
+    try:
+        client = _client
+        if client is None or STATE.get("power") != "Active":
+            return False
+        try:
+            sound = await asyncio.wait_for(client.get_sound_output(), timeout=PERIODIC_QUERY)
+        except Exception as exc:  # noqa: BLE001
+            log("звук не обновился (%s) — переподключаюсь" % str(exc)[:60])
+            _client = None
+            dropped = client
+            return False
+        if isinstance(sound, str) and sound:
+            STATE["sound"] = sound
+            STATE["sound_updated"] = time.time()
+            return True
+        return False
+    finally:
+        _lock.release()
+        if dropped is not None:
+            try:
+                await dropped.close()
+            except Exception:  # noqa: BLE001
+                pass
+
+
 async def periodic_state():
-    """Раз в минуту обновляем кэш состояния, пока ТВ включён."""
+    """Раз в минуту освежаем кэш звука.
+
+    Это не тот опрос, которым живёт сторож (`stb-watch` спрашивает состояние
+    сам, каждые несколько секунд): здесь только кэш для редких потребителей.
+    """
     while True:
         await asyncio.sleep(60)
-        try:
-            async with _lock:
-                if _client is not None and STATE.get("power") == "Active":
-                    STATE["sound"] = await _client.get_sound_output()
-        except Exception:  # noqa: BLE001
-            await drop()
+        await refresh_sound()
 
 
 async def main():

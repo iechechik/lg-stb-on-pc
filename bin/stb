@@ -101,8 +101,32 @@ def cli_call(*args, timeout=12):
         return subprocess.CompletedProcess(CLI, 1, stdout="", stderr=str(exc))
 
 
-def daemon_ok(req):
-    return bool(daemon().ask(req).get("ok"))
+def daemon_alive():
+    """Служба демона запущена? Сокет может остаться от прошлого запуска."""
+    try:
+        out = subprocess.run(["systemctl", "is-active", "stb-tv-link"],
+                             capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return out.strip() == "active"
+
+
+def tv_command(req, *fallback):
+    """Команда телевизору через демон.
+
+    Прямой вызов библиотеки — только когда демона нет вовсе. Если демон жив и
+    ответил отказом, повторять команду вторым соединением нельзя: это ломает
+    единственное SSAP-подключение к телевизору, а нажатие может сработать
+    дважды (клиент уже отправил его, демон всё ещё выполняет).
+    """
+    answer = daemon().ask(req)
+    if answer.get("ok"):
+        return 0
+    if answer.get("transport") and not daemon_alive():
+        need_tv()
+        return cli_call(*fallback).returncode
+    print(answer.get("msg") or "телевизор не выполнил команду", file=sys.stderr)
+    return 1
 
 
 def cmd_tv(argv):
@@ -117,10 +141,7 @@ def cmd_tv(argv):
         return subprocess.run(["sudo", "etherwake", "-i", TV_IF, TV_MAC]).returncode
 
     if what == "off":
-        if daemon_ok({"cmd": "power", "state": "off"}):
-            return 0
-        need_tv()
-        return cli_call("power_off").returncode
+        return tv_command({"cmd": "power", "state": "off"}, "power_off")
 
     if what == "powerstate":
         power = d.power()
@@ -151,22 +172,14 @@ def cmd_tv(argv):
         if not rest:
             print("укажи кнопку: stb tv key UP", file=sys.stderr)
             return 2
-        if daemon_ok({"cmd": "key", "name": rest[0].upper()}):
-            return 0
-        need_tv()
-        return cli_call("button", rest[0]).returncode
+        return tv_command({"cmd": "key", "name": rest[0].upper()}, "button", rest[0])
 
     if what in ("up", "down"):
-        if daemon_ok({"cmd": "vol", "dir": what}):
-            return 0
-        need_tv()
-        return cli_call("volume_" + what).returncode
+        return tv_command({"cmd": "vol", "dir": what}, "volume_" + what)
 
     if what in ("mute", "unmute"):
-        if daemon_ok({"cmd": "mute", "on": what == "mute"}):
-            return 0
-        need_tv()
-        return cli_call("set_mute", "True" if what == "mute" else "False").returncode
+        return tv_command({"cmd": "mute", "on": what == "mute"},
+                          "set_mute", "True" if what == "mute" else "False")
 
     if what == "vol":
         if not rest:
@@ -177,19 +190,13 @@ def cmd_tv(argv):
         except ValueError:
             print("громкость — число от 0 до 100", file=sys.stderr)
             return 2
-        if daemon_ok({"cmd": "vol", "level": level}):
-            return 0
-        need_tv()
-        return cli_call("set_volume", rest[0]).returncode
+        return tv_command({"cmd": "vol", "level": level}, "set_volume", rest[0])
 
     if what == "setinput":
         if not rest:
             print("укажи вход: stb tv setinput HDMI_3", file=sys.stderr)
             return 2
-        if daemon_ok({"cmd": "input", "id": rest[0]}):
-            return 0
-        need_tv()
-        return cli_call("set_input", rest[0]).returncode
+        return tv_command({"cmd": "input", "id": rest[0]}, "set_input", rest[0])
 
     if what == "getinputs":
         need_tv()
@@ -207,10 +214,7 @@ def cmd_tv(argv):
         if not rest:
             print("укажи приложение: stb tv app com.webos.app.browser", file=sys.stderr)
             return 2
-        if daemon_ok({"cmd": "app", "id": rest[0]}):
-            return 0
-        need_tv()
-        return cli_call("launch_app", rest[0]).returncode
+        return tv_command({"cmd": "app", "id": rest[0]}, "launch_app", rest[0])
 
     if what == "getapps":
         need_tv()
@@ -231,10 +235,7 @@ def cmd_tv(argv):
         if not rest:
             print("укажи выход: stb tv speaker external_arc", file=sys.stderr)
             return 2
-        if daemon_ok({"cmd": "speaker", "id": rest[0]}):
-            return 0
-        need_tv()
-        return cli_call("change_sound_output", rest[0]).returncode
+        return tv_command({"cmd": "speaker", "id": rest[0]}, "change_sound_output", rest[0])
 
     if what == "speaker-auto":
         if not TV_SPEAKER or not tv_alive():
@@ -397,6 +398,62 @@ def cmd_close(argv):
     if any(word in name for word in ("Приставка", "stb-web", "Mozilla Firefox")):
         return 0                      # сетку не закрываем
     subprocess.run(["xdotool", "windowclose", win], env=env, capture_output=True)
+    return 0
+
+
+def hidden_mark():
+    """Отметка «приложение скрыто»: время из mtime, заголовок окна внутри."""
+    return os.path.join(user_env()["XDG_RUNTIME_DIR"], "stb-app-hidden")
+
+
+def cmd_hide(argv):
+    """Убрать окно с экрана, не закрывая приложение: вернёмся — покажем."""
+    env = user_env()
+    win = subprocess.run(["xdotool", "getactivewindow"], env=env,
+                         capture_output=True, text=True).stdout.strip()
+    if not win:
+        return 0
+    name = (subprocess.run(["xdotool", "getwindowname", win], env=env,
+                           capture_output=True, text=True).stdout or "").strip()
+    if not name or any(w in name for w in ("Приставка", "stb-web", "Mozilla Firefox")):
+        return 0                      # сетку и браузер не прячем
+    subprocess.run(["wmctrl", "-i", "-r", win, "-b", "add,hidden"], env=env, capture_output=True)
+    try:
+        with open(hidden_mark(), "w", encoding="utf-8") as f:
+            f.write(name)
+    except OSError:
+        pass
+    minutes = int(stbconf.get("APP_HIDE_MINUTES", "10") or 0)
+    key_log("окно скрыто (%s) — вернусь или закрою через %d мин" % (name[:40], minutes))
+    return 0
+
+
+def hidden_check():
+    """Погасить приложение, которое слишком долго висит скрытым."""
+    mark = hidden_mark()
+    try:
+        age = time.time() - os.path.getmtime(mark)
+    except OSError:
+        return 0
+    minutes = int(stbconf.get("APP_HIDE_MINUTES", "10") or 0)
+    if minutes <= 0 or age < minutes * 60:
+        return 0
+    title = ""
+    try:
+        with open(mark, encoding="utf-8") as f:
+            title = f.read().strip()
+    except OSError:
+        pass
+    env = user_env()
+    if "jellyfin" in title.lower():
+        jelly_kill(env, "скрыто дольше %d мин" % minutes)
+    elif title:
+        subprocess.run(["wmctrl", "-c", title], env=env, capture_output=True)
+    try:
+        os.remove(mark)
+    except OSError:
+        pass
+    say("скрытое окно (%s) висело %d мин — приложение закрыто" % (title[:40], minutes))
     return 0
 
 
@@ -594,6 +651,7 @@ def cmd_boot(argv):
         say("boot: вход переключён на %s" % TV_INPUT)
     mode_set("nuc")
     subprocess.run(["/opt/stb/bin/stb-idle", "on"], capture_output=True, timeout=60)
+    close_splash_now()
     return 0
 
 
@@ -900,6 +958,9 @@ def key_power():
     open("/run/stb/waking", "w", encoding="utf-8").close()
     subprocess.Popen([sys.argv[0], "tv", "wake", "40"],
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, encoding="utf-8")
+    if splash_windows():
+        subprocess.Popen([sys.argv[0], "screensaver", "close"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, encoding="utf-8")
     return 0
 
 
@@ -922,8 +983,8 @@ def key_back():
         else:
             key_log("back → шаг назад в браузере")
         return 0
-    key_log("back → закрыть окно (%s)" % title)
-    return cmd_close([])
+    key_log("back → скрыть окно (%s)" % title)
+    return cmd_hide([])
 
 
 def key_home():
@@ -968,6 +1029,12 @@ def cmd_key(argv):
     if act not in KEY_ACTIONS:
         print("неизвестное действие: %s" % act, file=sys.stderr)
         return 2
+
+    if splash_windows():
+        # Заставка закрывается не только кнопками навигации: человек нажал
+        # пульт — значит он здесь, экран должен ожить.
+        subprocess.Popen([sys.argv[0], "screensaver", "close"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, encoding="utf-8")
 
     mode = mode_get()
     if mode == "tv":
@@ -1159,6 +1226,12 @@ HELP = {
     ]),
     "nic-watch": ("сетевой чип", [
         ("stb nic-watch", "сбросить линк, если в dmesg новые зависания чипа (таймер)"),
+    ]),
+    "hide": ("скрыть окно приложения", [
+        ("stb hide", "убрать окно с экрана, не закрывая приложение (так работает Back в плеере)"),
+    ]),
+    "hidden": ("скрытые окна", [
+        ("stb hidden check", "закрыть приложение, скрытое дольше APP_HIDE_MINUTES (зовёт сторож)"),
     ]),
     "player": ("плеер на приставке", [
         ("stb player", "Jellyfin Desktop на приставке (не на телевизоре)"),
@@ -1555,6 +1628,9 @@ def cmd_idle(argv):
             as_user("systemctl", "--user", "start", "stb-browser")
             if tv_alive() and not ensure_browser():
                 return 1
+        # Firefox после перезапуска восстанавливает вкладки, и активной может
+        # оказаться чёрная — тогда телевизор показывает пустой экран вместо сетки.
+        close_splash_now()
     else:
         say_idle("ТВ выключен → powersave сразу")
         governor("powersave")
@@ -1805,7 +1881,16 @@ def cmd_player(argv):
 
     windows = jelly_windows(env)
     if windows:
-        fullscreen(windows[0].split()[0])
+        wid = windows[0].split()[0]
+        subprocess.run(["wmctrl", "-i", "-r", wid, "-b", "remove,hidden"], env=env, capture_output=True)
+        fullscreen(wid)
+        # Возврат в приложение: звук к этому моменту мог быть погашен лёгким режимом.
+        for unit in ("pipewire.socket", "pipewire-pulse.socket", "wireplumber"):
+            as_user("systemctl", "--user", "start", unit)
+        try:
+            os.remove(hidden_mark())
+        except OSError:
+            pass
         print("Jellyfin уже открыт")
         return 0
 
@@ -1814,6 +1899,16 @@ def cmd_player(argv):
         jelly_kill(env, "висящий экземпляр без окна")
         time.sleep(1)
 
+    # Пока flatpak-экземпляр числится живым, `flatpak run` не создаёт новое окно,
+    # а «активирует» прежний. Ждём, пока он исчезнет из списка запущенных.
+    for _ in range(20):
+        listed = subprocess.run(["flatpak", "ps"], env=env, capture_output=True,
+                                text=True).stdout.lower()
+        if "jellyfin" not in listed:
+            break
+        subprocess.run(["flatpak", "kill", JELLY_APP], env=env, capture_output=True)
+        time.sleep(0.5)
+
     try:
         player_log = open("/var/log/stb/jellyfin.log", "w", encoding="utf-8")
     except OSError:
@@ -1821,7 +1916,9 @@ def cmd_player(argv):
     subprocess.Popen(["flatpak", "run", JELLY_APP, "--tv", "--fullscreen"], env=env,
                      stdout=player_log, stderr=subprocess.STDOUT, start_new_session=True)
 
-    for _ in range(30):
+    # Приложение-пульт ждёт ответ 20 с: дольше держать бессмысленно, пользователь
+    # уже увидел бы ошибку.
+    for _ in range(20):
         time.sleep(1)
         windows = jelly_windows(env)
         if windows:
@@ -1831,7 +1928,7 @@ def cmd_player(argv):
             return 0
 
     # Окно не появилось — процесс бесполезен, убираем, чтобы не висел в фоне.
-    jelly_kill(env, "окно не появилось за 30 с")
+    jelly_kill(env, "окно не появилось за 20 с")
     print("Jellyfin не показал окно — процесс выключен, смотри /var/log/stb/jellyfin.log",
           file=sys.stderr)
     return 1
@@ -1847,14 +1944,17 @@ def tv_shows_own_app():
     """
     if not TV_INPUT:
         return False
+    ours = "com.webos.app." + TV_INPUT.lower().replace("_", "")
     try:
         app = (daemon().state() or {}).get("app") or ""
     except Exception:  # noqa: BLE001
         app = ""
     if not app:
-        # состояние приложения неизвестно (демон молчит) — лучше не гасить:
-        # выключить телевизор посреди фильма хуже, чем не включить заставку
-        return True
+        # Неизвестно — это НЕ «телевизор показывает своё». Раньше здесь стояло
+        # True, и короткая потеря связи с демоном сбрасывала отсчёт простоя:
+        # заставка закрывалась, метка снималась, телевизор не гас никогда.
+        # Возвращаем None: и гасить нельзя, и сбрасывать отсчёт не за что.
+        return None
     return app.lower() != ours
 
 
@@ -1884,8 +1984,51 @@ def cmd_poweroff(argv):
     return 0
 
 
+def splash_windows():
+    """Окна с чёрной заставкой (это вкладка в окне Firefox, не отдельное окно)."""
+    out = as_user("xdotool", "search", "--name", "Заставка").stdout.split()
+    return [w for w in out if w.isdigit()]
+
+
+def grid_window():
+    out = as_user("xdotool", "search", "--name", "Приставка").stdout.split()
+    return any(w.isdigit() for w in out)
+
+
+def close_splash_now():
+    """Закрыть заставку, не убивая окно сетки: гасим вкладку, а не окно."""
+    wins = splash_windows()
+    for wid in wins:
+        as_user("xdotool", "windowactivate", "--sync", wid)
+        time.sleep(0.3)
+        as_user("xdotool", "key", "--clearmodifiers", "F11")
+        time.sleep(0.3)
+        as_user("xdotool", "key", "--clearmodifiers", "ctrl+w")
+        time.sleep(0.9)
+    for wid in splash_windows():
+        as_user("wmctrl", "-i", "-c", hex(int(wid)))
+        time.sleep(0.4)
+    runtime = user_env()["XDG_RUNTIME_DIR"]
+    for name in ("stb-screenblank", "stb-tv-slept"):
+        try:
+            os.remove(os.path.join(runtime, name))
+        except OSError:
+            pass
+    if not grid_window():
+        try:
+            screen_on = open(SCREEN_FLAG, encoding="utf-8").read().strip() == "on"
+        except OSError:
+            screen_on = True
+        # Возврат к экрану, а сетки нет (закрыли или упал) — поднимаем.
+        if screen_on and mode_get() == "nuc":
+            ensure_browser()
+    return 0
+
+
 def cmd_screensaver(argv):
     """Сторож простоя: чёрная вкладка, затем гашение телевизора."""
+    if argv and argv[0] == "close":
+        return close_splash_now()
     import fcntl
 
     minutes = int(stbconf.get("SCREENSAVER_MINUTES", "5") or 5)
@@ -1922,20 +2065,7 @@ def cmd_screensaver(argv):
         return bool(width) and bool(disp) and width == disp[0]
 
     def close_splash():
-        if not splash():
-            return
-        as_user("xdotool", "key", "--clearmodifiers", "F11")
-        time.sleep(0.4)
-        as_user("xdotool", "key", "--clearmodifiers", "ctrl+w")
-        time.sleep(0.6)
-        if splash():
-            as_user("wmctrl", "-c", "Заставка")
-            time.sleep(0.3)
-        for marker in (opened_at, slept_marker):
-            try:
-                os.remove(marker)
-            except OSError:
-                pass
+        return close_splash_now()
 
     def go(url):
         as_user("xdotool", "key", "--clearmodifiers", "ctrl+l")
@@ -1976,7 +2106,8 @@ def cmd_screensaver(argv):
             state = open(SCREEN_FLAG, encoding="utf-8").read().strip() or "on"
         except OSError:
             state = "on"
-        if state != "on" or mode_get() != "nuc" or tv_shows_own_app():
+        own = tv_shows_own_app()
+        if state != "on" or mode_get() != "nuc" or own is True:
             close_splash()
             time.sleep(5)
             continue
@@ -1984,29 +2115,32 @@ def cmd_screensaver(argv):
         idle_out = as_user("xprintidle").stdout.strip()
         idle = int(idle_out) if idle_out.isdigit() else 0
 
-        if splash():
-            age = 0
-            if os.path.exists(opened_at):
-                age = max(0, int(time.time() - os.path.getmtime(opened_at)))
-            else:
-                open(opened_at, "w", encoding="utf-8").close()
+        # Отсчёт до гашения идёт по отметке, а не по окну заставки: браузер мог
+        # упасть или его закрыли, и тогда раньше телевизор не гас никогда.
+        if os.path.exists(opened_at):
+            age = max(0, int(time.time() - os.path.getmtime(opened_at)))
 
             if age >= 10 and idle < 3000:
                 close_splash()
+                time.sleep(2)
+                continue
 
-            if (sleep_after > 0 and age >= sleep_after and not os.path.exists(slept_marker)
-                    and splash() and mode_get() == "nuc" and state == "on"):
-                if daemon().power() == "Active":
-                    if cmd_tv(["off"]) == 0:
+            if sleep_after > 0 and age >= sleep_after and not os.path.exists(slept_marker):
+                if mode_get() == "nuc" and state == "on" and own is False:
+                    if daemon().power() == "Active":
+                        if cmd_tv(["off"]) == 0:
+                            open(slept_marker, "w", encoding="utf-8").close()
+                            log("тишина %d с — гашу телевизор (порог %d мин)"
+                                % (age, sleep_after // 60))
+                    else:
                         open(slept_marker, "w", encoding="utf-8").close()
-                        log("заставка %d с — гашу телевизор (тишина %d мин)"
-                            % (age, sleep_after // 60))
-                else:
-                    open(slept_marker, "w", encoding="utf-8").close()
             time.sleep(2)
             continue
 
         if idle >= limit_ms:
+            # Метку ставим ДО попытки открыть вкладку: если браузера нет,
+            # заставка не откроется, но отсчёт до гашения уже пошёл.
+            open(opened_at, "w", encoding="utf-8").close()
             open_splash()
             time.sleep(2)
             continue
@@ -2030,6 +2164,8 @@ COMMANDS = {
     "jelly": cmd_jelly,
     "live": cmd_live,
     "close": cmd_close,
+    "hide": cmd_hide,
+    "hidden": lambda argv: hidden_check() if not argv or argv[0] == "check" else 2,
     "lang": cmd_lang,
     "ctl": cmd_ctl,
     "boot": cmd_boot,

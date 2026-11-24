@@ -62,3 +62,11 @@ def test_no_black_screen_when_state_unknown(watch):
     """Живой телевизор, но состояние не получено — экран гасить нельзя."""
     assert watch.decide("", None, True, True, 0) is True
     assert watch.decide("Suspend", OLD, True, True, 0) is True
+
+def test_start_unknown_does_not_power_off(watch, monkeypatch):
+    """Телевизор в сети, но состояние ещё не получено — не решаем «выключен»."""
+    monkeypatch.setattr(watch, "tv_in_network", lambda: True)
+    monkeypatch.setattr(watch, "daemon_ask", lambda req, timeout=5.0: {"ok": False})
+    watch._last_on = None
+    watch._last_state = None
+    assert watch.tv_is_on() is None

@@ -102,11 +102,10 @@ def power_state():
     """
     answer = daemon_ask({"cmd": "state"})
     state = answer.get("state") or {}
-    age = None
-    if state.get("updated"):
-        age = max(0.0, time.time() - float(state["updated"]))
-    if answer.get("stale"):
-        age = None            # ответ помечен как несвежий — считаем неизвестным
+    # Возраст берём у самого питания: ответ на вопрос о звуке или приложении не
+    # делает состояние питания свежим, а сторож решает именно по нему.
+    stamp = state.get("power_updated") or state.get("updated")
+    age = max(0.0, time.time() - float(stamp)) if stamp else None
     return (state.get("power") or ""), age
 
 
@@ -152,6 +151,15 @@ def tv_is_on():
         _net_misses = 0
     else:
         _net_misses += 1
+
+    if online and not state and _last_on is None:
+        # Телевизор отвечает, но о питании ещё ни разу не спросили. Решать по
+        # этому «выключен» нельзя: на старте сторож гасил экран включённого
+        # телевизора. Возвращаем «не знаю» — смотреть нечего, ждём ответа.
+        if _last_state != "начало":
+            log("tv", "телевизор в сети, состояние ещё не получено — экран не трогаю")
+            _last_state = "начало"
+        return None
 
     on = decide(state, age, online, _last_on, _net_misses)
 
@@ -247,7 +255,13 @@ STATE_MAX_AGE = float(os.environ.get("STB_TV_STATE_MAX_AGE")
 
 
 def jelly_has_window():
-    """Есть ли видимое окно плеера (wmctrl перечисляет только показанные)."""
+    """Есть ли у плеера окно, которое действительно видно.
+
+    `wmctrl` перечисляет и скрытые окна, поэтому сама строка в списке ничего не
+    значит: смотрим состояние окна (`xwininfo`). Окно, спрятанное нашей же
+    командой `stb hide`, видимым не является, но гасить его нельзя — для этого
+    есть отметка `/run/user/1000/stb-app-hidden`.
+    """
     env = {"DISPLAY": ":0", "XAUTHORITY": os.path.join(STB_HOME, ".Xauthority"),
            "HOME": STB_HOME}
     try:
@@ -255,7 +269,21 @@ def jelly_has_window():
                              text=True, timeout=10).stdout
     except (OSError, subprocess.SubprocessError):
         return True                      # не смогли проверить — не трогаем
-    return any("jellyfin-desktop" in line.lower() for line in out.splitlines())
+    wins = [line.split()[0] for line in out.splitlines()
+            if "jellyfin-desktop" in line.lower() and line.split()]
+    if not wins:
+        return False
+    for wid in wins:
+        try:
+            info = subprocess.run(["xwininfo", "-id", wid], env=env, capture_output=True,
+                                  text=True, timeout=10).stdout
+        except (OSError, subprocess.SubprocessError):
+            return True
+        if "IsViewable" in info:
+            return True
+    # Окно есть, но не показано: если это наше намеренное скрытие — не трогаем.
+    return os.path.exists(os.path.join("/run/user/%d" % os.stat(STB_HOME).st_uid,
+                                       "stb-app-hidden"))
 
 
 def jelly_processes():
@@ -321,6 +349,11 @@ def watch_tv():
             cur = tv_is_on()
         except Exception as exc:  # noqa: BLE001
             log("tv", "ошибка проверки: %r" % (exc,))
+            time.sleep(CHECK_EVERY)
+            continue
+
+        if cur is None:
+            # Состояние ещё не получено — ничего не переключаем.
             time.sleep(CHECK_EVERY)
             continue
 
@@ -838,7 +871,10 @@ def watch_bt_pointer():
                     ready, _, _ = await asyncio.get_running_loop().run_in_executor(
                         None, lambda: select.select(list(devices.values()), [], [], 0))
                     for dev in ready:
-                        dev.read()
+                        # read() — генератор: без перебора очередь не вычитывается,
+                        # и после возврата в режим приставки прилетают старые движения.
+                        for _ in dev.read():
+                            pass
                 except Exception:  # noqa: BLE001
                     pass
                 await asyncio.sleep(0.2)
@@ -884,8 +920,23 @@ def watch_bt_pointer():
     asyncio.run(watch())
 
 
+def watch_hidden():
+    """Скрытые окна: если приложение не вернули, гасим его по таймеру."""
+    while True:
+        try:
+            done = subprocess.run(["/opt/stb/bin/stb", "hidden", "check"],
+                                  capture_output=True, text=True, timeout=60, check=False)
+            out = (done.stdout or "").strip()
+            if out:
+                log("app", out.replace("\n", " | ")[:200])
+        except Exception as exc:  # noqa: BLE001
+            log("app", "проверка скрытых окон не удалась (%r)" % (exc,))
+        time.sleep(20)
+
+
 SECTIONS = {
     "tv": watch_tv,
+    "app": watch_hidden,
     "audio": watch_audio,
     "wol": watch_wol,
     "chassis": watch_chassis,

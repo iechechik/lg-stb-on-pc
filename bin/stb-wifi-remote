@@ -50,6 +50,14 @@ SEND_HZ = 25
 
 UUID = stbconf.get("WF_UUID", "").strip()   # пусто — придумаем при старте
 ST_LG = "urn:lge-com:service:webos-second-screen:1"
+# Типы, которые приставка изображает: телевизор webOS, рендерер и DIAL.
+# Всё остальное — не наше, на такие поиски не отвечаем.
+KNOWN_ST = frozenset({
+    "urn:lge-com:service:webos-second-screen:1",
+    "urn:schemas-upnp-org:device:MediaRenderer:1",
+    "urn:dial-multiscreen-org:service:dial:1",
+    "upnp:rootdevice",
+})
 ST_RENDERER = "urn:schemas-upnp-org:device:MediaRenderer:1"
 
 
@@ -211,7 +219,9 @@ async def do_action(name):
     if mode() == "tv":
         req = stbkeys.request(act)
         if req is not None:
-            resp = await TV_DAEMON.aask(req, timeout=4)
+            # 8 с — дольше бюджета демона (6 с): иначе клиент бросает команду,
+            # демон всё ещё её выполняет, а пульт шлёт повтор.
+            resp = await TV_DAEMON.aask(req, timeout=8)
             if resp.get("ok"):
                 stbkeys.log_line(act)
                 w(f"    кнопка {name} -> {act} (демон)")
@@ -328,10 +338,15 @@ async def ssdp_server():
             if line.lower().startswith("st:"):
                 st = line.split(":", 1)[1].strip()
         answers = []
-        if "ssdp:all" in st or ST_LG in st:
-            answers.append(ST_LG)
-        if "ssdp:all" in st or ST_RENDERER in st:
-            answers.append(ST_RENDERER)
+        if "ssdp:all" in st:
+            answers.extend([ST_LG, ST_RENDERER])
+        elif st.strip() in KNOWN_ST:
+            # Приложение-пульт делает несколько поисков и без ответа на свой тип
+            # считает, что телевизора нет. Отвечаем тем же ST — но только на те,
+            # что мы действительно изображаем, а не на любой встречный.
+            answers.append(st.strip())
+        else:
+            w("SSDP: поиск неизвестного типа пропущен: %s" % st.strip()[:60])
         for a in answers:
             await loop.sock_sendto(sock, ssdp_packet(a), addr)
 

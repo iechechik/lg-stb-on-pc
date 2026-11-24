@@ -13,8 +13,13 @@ import asyncio
 import json
 import os
 import socket
+import time
 
 SOCK = os.environ.get("STB_TV_SOCK", "/run/stb/tv.sock")
+
+# Клиент ждёт дольше, чем демон тратит на команду (6 с): иначе пульт считает
+# нажатие неудачным и повторяет его, а демон ещё выполняет первое.
+DEFAULT_TIMEOUT = 8.0
 
 
 class TvDaemon:
@@ -22,7 +27,14 @@ class TvDaemon:
         self.path = path
 
     # ------------------------------------------------------------ синхронно
-    def ask(self, req, timeout=6.0):
+    def ask(self, req, timeout=DEFAULT_TIMEOUT):
+        """Запрос к демону.
+
+        `transport: True` в ответе значит «до демона не достучались» — только
+        тогда имеет смысл прямое подключение к телевизору. Ответ демона с
+        `ok: False` без этого признака — отказ телевизора, повторять нельзя.
+        """
+        s = None
         try:
             s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             s.settimeout(timeout)
@@ -34,10 +46,16 @@ class TvDaemon:
                 if not chunk:
                     break
                 data += chunk
-            s.close()
             return json.loads(data.decode("utf-8", "replace") or "{}")
-        except (OSError, ValueError):
-            return {"ok": False}
+        except (OSError, ValueError) as exc:
+            return {"ok": False, "transport": True,
+                    "msg": "демон не ответил (%s)" % type(exc).__name__}
+        finally:
+            if s is not None:
+                try:
+                    s.close()
+                except OSError:
+                    pass
 
     def state(self):
         return (self.ask({"cmd": "state"}).get("state") or {})
@@ -46,17 +64,28 @@ class TvDaemon:
         return self.state().get("power") or ""
 
     # ------------------------------------------------------------ асинхронно
-    async def aask(self, req, timeout=6.0):
+    async def aask(self, req, timeout=DEFAULT_TIMEOUT):
+        """Асинхронный запрос: один срок на всё — соединение, отправку и ответ."""
+        deadline = time.monotonic() + timeout
+        writer = None
         try:
+            left = max(0.1, deadline - time.monotonic())
             reader, writer = await asyncio.wait_for(
-                asyncio.open_unix_connection(self.path), timeout=timeout)
+                asyncio.open_unix_connection(self.path), timeout=left)
             writer.write((json.dumps(req, ensure_ascii=False) + "\n").encode("utf-8"))
-            await writer.drain()
-            line = await asyncio.wait_for(reader.readline(), timeout=timeout)
-            writer.close()
+            await asyncio.wait_for(writer.drain(), timeout=max(0.1, deadline - time.monotonic()))
+            line = await asyncio.wait_for(reader.readline(),
+                                          timeout=max(0.1, deadline - time.monotonic()))
             return json.loads(line.decode("utf-8", "replace") or "{}")
-        except (OSError, ValueError, asyncio.TimeoutError):
-            return {"ok": False}
+        except (OSError, ValueError, asyncio.TimeoutError) as exc:
+            return {"ok": False, "transport": True,
+                    "msg": "демон не ответил (%s)" % type(exc).__name__}
+        finally:
+            if writer is not None:
+                try:
+                    writer.close()
+                except Exception:  # noqa: BLE001
+                    pass
 
     async def key(self, name):
         return await self.aask({"cmd": "key", "name": str(name).upper()})

@@ -60,19 +60,52 @@ async def read_ws_frame(reader, max_size=MAX_MESSAGE):
     return opcode, payload
 
 
+# Незаконченные сообщения: ключ — id(reader), значение — состояние сборки.
+# Держим и сам reader, чтобы его id не был переиспользован другим соединением.
+_PENDING = {}
+
+
+def _drop_pending(key):
+    _PENDING.pop(key, None)
+
+
 async def read_ws_message(reader, max_size=MAX_MESSAGE):
-    """Сообщение целиком: фрагменты склеиваются, управляющие кадры — как есть."""
-    opcode, payload, fin = await _frame(reader, max_size)
-    if opcode >= 0x8:            # ping/pong/close не фрагментируются
-        return opcode, payload
-    parts = [payload]
-    size = len(payload)
-    while not fin:
+    """Сообщение целиком; управляющий кадр внутри сообщения не ломает сборку.
+
+    Клиент вправе прислать PING между фрагментами (TEXT FIN=0, PING,
+    CONTINUATION FIN=1). Тогда ping отдаётся вызывающему сразу, а сборка
+    продолжается со следующего вызова: состояние лежит в `_PENDING`.
+    """
+    key = id(reader)
+    state = _PENDING.get(key)
+
+    if state is None:
+        opcode, payload, fin = await _frame(reader, max_size)
+        if opcode >= 0x8:            # ping/pong/close не фрагментируются
+            return opcode, payload
+        if opcode == 0x0:
+            raise ValueError("продолжение без начала сообщения")
+        if fin:
+            return opcode, payload
+        state = {"reader": reader, "opcode": opcode, "parts": [payload],
+                 "size": len(payload)}
+        _PENDING[key] = state
+
+    while True:
         op, chunk, fin = await _frame(reader, max_size)
-        if op != 0x0:            # новое сообщение вместо продолжения — отдаём как есть
-            break
-        size += len(chunk)
-        if size > max_size:
+        if op >= 0x8:
+            # Управляющий кадр: отдаём его, а сборку оставляем до следующего раза.
+            if op == 0x8:            # close — сообщение уже не продолжится
+                _drop_pending(key)
+            return op, chunk
+        if op != 0x0:
+            _drop_pending(key)
+            raise ValueError("неожиданный кадр %#x внутри сообщения" % op)
+        state["size"] += len(chunk)
+        if state["size"] > max_size:
+            _drop_pending(key)
             raise ValueError("сообщение больше %d байт" % max_size)
-        parts.append(chunk)
-    return opcode, b"".join(parts)
+        state["parts"].append(chunk)
+        if fin:
+            _drop_pending(key)
+            return state["opcode"], b"".join(state["parts"])
