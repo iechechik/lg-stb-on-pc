@@ -1,0 +1,15 @@
+# мусор
+__pycache__/
+*.pyc
+*.bak
+*.bak-*
+*.py-
+*.swp
+
+# ключи и состояние
+tv_key/
+*.token
+
+# профиль браузера: бинарная база масштаба, собирается на месте
+home/.mozilla/stb/content-prefs.sqlite
+.aiopylgtv.sqlite

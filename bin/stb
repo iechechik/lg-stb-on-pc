@@ -1,0 +1,2079 @@
+#!/usr/bin/env python3
+"""stb — одна команда для всего, что делает приставка.
+
+    stb tv on|off|status|powerstate
+    stb tv key UP | stb tv up | stb tv down | stb tv mute | stb tv unmute
+    stb tv vol 12 | stb tv setinput HDMI_3 | stb tv app com.webos.app.browser
+    stb tv speakers | stb tv speaker external_arc | stb tv speaker-auto
+    stb tv getinputs | stb tv getapps | stb tv autooff15min [on|off]
+
+    stb mode [nuc|tv]        текущий режим пульта или переключить
+    stb toggle               приставка ↔ телевизор одной командой
+    stb live                 перейти на телевизор (его эфир)
+    stb box                  вернуть вход приставки
+    stb jelly                запустить Jellyfin на телевизоре
+    stb close                закрыть активное окно (сетку не трогаем)
+
+    stb key <действие>       кнопка пульта с учётом режима
+    stb lang [ru|en|toggle|status]   раскладка клавиатуры приставки
+    stb ctl [status|restart|stop|start]   службы комплекса
+
+Если программу вызвать как `tv`, она делает то же, что `stb tv`:
+это одна и та же программа под двумя именами.
+"""
+import json
+import os
+import re
+import subprocess
+import time
+import sys
+
+sys.path.insert(0, "/opt/stb/lib")
+import stbconf  # noqa: E402
+from stbtv import TvDaemon  # noqa: E402
+
+STB_HOME = stbconf.get("STB_HOME", "/home/stbuser")
+STB_USER = stbconf.get("STB_USER", "stbuser")
+TV = stbconf.get("TV_IP", "")
+TV_PORT = stbconf.get("TV_PORT", "3000")
+TV_MAC = stbconf.get("TV_MAC", "")
+TV_IF = stbconf.get("TV_IF", "enp0s25")
+TV_INPUT = stbconf.get("TV_INPUT_ID", "")
+TV_APP = stbconf.get("TV_APP_ID", "")
+TV_LIVE = stbconf.get("TV_LIVE_APP", "com.webos.app.livetv")
+TV_SPEAKER = stbconf.get("TV_SPEAKER", "")
+TV_SPEAKERS = stbconf.get("TV_SPEAKERS", "")
+MODE_FILE = "/run/stb/mode"
+SCREEN_FLAG = "/run/stb/screensaver"
+LOG = "/var/log/stb/tv.log"
+TVCTL = os.path.join(STB_HOME, "tvctl")
+# ключ доступа обязателен: без него библиотека считает приставку новой
+# и уходит регистрироваться — из-под root это выглядело как зависание
+CLI = [os.path.join(TVCTL, "bin", "bscpylgtvcommand"),
+       "-m", os.path.join(TVCTL, "nuc_manifest.json"),
+       "-p", os.path.join(STB_HOME, ".aiopylgtv.sqlite")]
+PY = os.path.join(TVCTL, "bin", "python")
+
+
+def say(msg):
+    line = "%s %s\n" % (subprocess.run(["date", "+%F %T"], capture_output=True,
+                                       text=True).stdout.strip(), msg)
+    try:
+        with open(LOG, "a", encoding="utf-8") as f:
+            f.write(line)
+    except OSError:
+        pass
+
+
+def daemon():
+    return TvDaemon()
+
+
+# ═══════════════════════════════════════════════════════════ телевизор
+def tv_alive():
+    import socket
+    try:
+        with socket.create_connection((TV, int(TV_PORT)), timeout=1):
+            return True
+    except OSError:
+        return False
+
+
+def need_tv():
+    if not tv_alive():
+        print("телевизор %s не отвечает (выключен или потерял сеть)" % TV, file=sys.stderr)
+        sys.exit(1)
+
+
+def cli_call(*args, timeout=12):
+    """Прямой вызов библиотеки телевизора. Недоступна — пустой ответ, без падения."""
+    env = dict(os.environ, HOME=STB_HOME)
+    try:
+        # cwd важен: sqlitedict открывает ключ телевизора относительно каталога,
+        # и из недоступного каталога падает «unable to open database file».
+        return subprocess.run(CLI + [TV] + list(args), capture_output=True, cwd=STB_HOME,
+                              text=True, timeout=timeout, env=env)
+    except subprocess.TimeoutExpired:
+        print("телевизор не ответил за %d с" % timeout, file=sys.stderr)
+        return subprocess.CompletedProcess(CLI, 1, stdout="", stderr="timeout")
+    except (OSError, subprocess.SubprocessError) as exc:
+        print("библиотека телевизора недоступна: %s" % exc, file=sys.stderr)
+        return subprocess.CompletedProcess(CLI, 1, stdout="", stderr=str(exc))
+
+
+def daemon_ok(req):
+    return bool(daemon().ask(req).get("ok"))
+
+
+def cmd_tv(argv):
+    what = argv[0] if argv else ""
+    rest = argv[1:]
+    d = daemon()
+
+    if what == "on":
+        if not TV_MAC:
+            print("не задан TV_MAC в /etc/stb/config", file=sys.stderr)
+            return 1
+        return subprocess.run(["sudo", "etherwake", "-i", TV_IF, TV_MAC]).returncode
+
+    if what == "off":
+        if daemon_ok({"cmd": "power", "state": "off"}):
+            return 0
+        need_tv()
+        return cli_call("power_off").returncode
+
+    if what == "powerstate":
+        power = d.power()
+        if power:
+            print(power)
+            return 0
+        need_tv()
+        out = cli_call("get_power_state").stdout
+        match = re.search(r"'state': '([^']*)'", out)
+        if match:
+            print(match.group(1))
+            return 0
+        return 1
+
+    if what == "status":
+        need_tv()
+        power = d.power()
+        if power and power != "Active":
+            print("телевизор выключен (%s)" % power)
+            return 0
+        for name in ("get_sound_output", "get_audio_status", "get_current_app"):
+            line = cli_call(name).stdout.strip()
+            if line:
+                print(line)
+        return 0
+
+    if what == "key":
+        if not rest:
+            print("укажи кнопку: stb tv key UP", file=sys.stderr)
+            return 2
+        if daemon_ok({"cmd": "key", "name": rest[0].upper()}):
+            return 0
+        need_tv()
+        return cli_call("button", rest[0]).returncode
+
+    if what in ("up", "down"):
+        if daemon_ok({"cmd": "vol", "dir": what}):
+            return 0
+        need_tv()
+        return cli_call("volume_" + what).returncode
+
+    if what in ("mute", "unmute"):
+        if daemon_ok({"cmd": "mute", "on": what == "mute"}):
+            return 0
+        need_tv()
+        return cli_call("set_mute", "True" if what == "mute" else "False").returncode
+
+    if what == "vol":
+        if not rest:
+            print("укажи громкость: stb tv vol 12", file=sys.stderr)
+            return 2
+        try:
+            level = int(rest[0])
+        except ValueError:
+            print("громкость — число от 0 до 100", file=sys.stderr)
+            return 2
+        if daemon_ok({"cmd": "vol", "level": level}):
+            return 0
+        need_tv()
+        return cli_call("set_volume", rest[0]).returncode
+
+    if what == "setinput":
+        if not rest:
+            print("укажи вход: stb tv setinput HDMI_3", file=sys.stderr)
+            return 2
+        if daemon_ok({"cmd": "input", "id": rest[0]}):
+            return 0
+        need_tv()
+        return cli_call("set_input", rest[0]).returncode
+
+    if what == "getinputs":
+        need_tv()
+        out = cli_call("get_inputs").stdout.strip()
+        try:
+            import ast
+            for item in ast.literal_eval(out):
+                if isinstance(item, dict) and item.get("id"):
+                    print(item["id"])
+        except Exception:  # noqa: BLE001
+            print(out)
+        return 0
+
+    if what == "app":
+        if not rest:
+            print("укажи приложение: stb tv app com.webos.app.browser", file=sys.stderr)
+            return 2
+        if daemon_ok({"cmd": "app", "id": rest[0]}):
+            return 0
+        need_tv()
+        return cli_call("launch_app", rest[0]).returncode
+
+    if what == "getapps":
+        need_tv()
+        return show_apps()
+
+    if what == "speakers":
+        cur = d.state().get("sound")
+        if cur:
+            print("сейчас: %s" % cur)
+        else:
+            need_tv()
+            print("сейчас: %s" % cli_call("get_sound_output").stdout.strip().strip("'\""))
+        if TV_SPEAKERS:
+            print("возможные (из конфига): %s" % TV_SPEAKERS)
+        return 0
+
+    if what == "speaker":
+        if not rest:
+            print("укажи выход: stb tv speaker external_arc", file=sys.stderr)
+            return 2
+        if daemon_ok({"cmd": "speaker", "id": rest[0]}):
+            return 0
+        need_tv()
+        return cli_call("change_sound_output", rest[0]).returncode
+
+    if what == "speaker-auto":
+        if not TV_SPEAKER or not tv_alive():
+            return 0
+        cur = d.state().get("sound") or cli_call("get_sound_output").stdout.strip().strip("'\"")
+        if cur == TV_SPEAKER:
+            return 0
+        d.ask({"cmd": "speaker", "id": TV_SPEAKER})
+        print("звук: %s → %s" % (cur, TV_SPEAKER))
+        return 0
+
+    if what == "text":
+        return cmd_tv_text(rest)
+
+    if what == "setting":
+        return cmd_tv_setting(rest)
+
+    if what == "wake":
+        return cmd_tv_wake(rest)
+
+    if what == "register":
+        return cmd_tv_register(rest)
+
+    if what == "learn":
+        return cmd_tv_learn(rest)
+
+    if what == "shutdown":
+        return cmd_tv_shutdown(rest)
+
+    print(__doc__.strip().split("\n\n")[0], file=sys.stderr)
+    print("неизвестная команда: tv %s" % what, file=sys.stderr)
+    return 1
+
+
+def show_apps():
+    """Список приложений телевизора без системных (кроме браузера и эфира)."""
+    import ast
+
+    hidden = ("com.webos.", "com.palm", "com.palmdts.")
+    keep = {"com.webos.app.browser", "com.webos.app.livetv"}
+    out = subprocess.run(CLI + [TV, "get_apps_all", "true"], capture_output=True,
+                         text=True, timeout=30).stdout.strip()
+    try:
+        for item in ast.literal_eval(out):
+            if isinstance(item, dict) and item.get("id"):
+                app_id = str(item["id"])
+                if app_id.startswith(hidden) and app_id not in keep:
+                    continue
+                print("%s  (%s)" % (app_id, item.get("title", "")))
+    except Exception:  # noqa: BLE001
+        print(out)
+    return 0
+
+
+# ═══════════════════════════════════════════════════════════ режимы
+def mode_get():
+    try:
+        with open(MODE_FILE, encoding="utf-8") as f:
+            return f.read().strip() or "nuc"
+    except OSError:
+        return "nuc"
+
+
+def mode_set(new):
+    """Переключить режим пульта. В режиме приставки работает заставка, в ТВ — нет."""
+    os.makedirs("/run/stb", exist_ok=True)
+    with open(MODE_FILE, "w", encoding="utf-8") as f:
+        f.write(new + "\n")
+    try:
+        with open(SCREEN_FLAG, "w", encoding="utf-8") as f:
+            f.write("on\n" if new != "tv" else "off\n")
+    except OSError:
+        pass
+    return new
+
+
+def cmd_mode(argv):
+    if not argv:
+        print(mode_get())
+        return 0
+    what = argv[0]
+    if what not in ("nuc", "tv"):
+        print("usage: stb mode [nuc|tv]", file=sys.stderr)
+        return 2
+    print(mode_set(what))
+    return 0
+
+
+def cmd_box(argv):
+    """Вернуть вход приставки и режим nuc."""
+    if TV_INPUT:
+        cmd_tv(["setinput", TV_INPUT])
+    mode_set("nuc")
+    print("приставка")
+    return 0
+
+
+def wake_tv(seconds=45):
+    """Разбудить телевизор и дождаться ответа."""
+    if cmd_tv(["on"]) != 0:
+        return False
+    for _ in range(int(seconds)):
+        if daemon().power() == "Active" or tv_alive():
+            return True
+        subprocess.run(["sleep", "1"])
+    return False
+
+
+def cmd_jelly(argv):
+    """Запустить Jellyfin на телевизоре и перевести пульт в режим ТВ."""
+    if not wake_tv(45):
+        say("jelly: телевизор не проснулся")
+        print("телевизор не проснулся", file=sys.stderr)
+        return 1
+    cmd_tv(["app", TV_APP])
+    subprocess.run(["sleep", "2"])
+    mode_set("tv")
+    cmd_tv(["speaker-auto"])
+    say("jelly: запущено на телевизоре")
+    print("Jellyfin на телевизоре")
+    return 0
+
+
+def cmd_live(argv):
+    """Перейти на свой эфир телевизора (не Jellyfin)."""
+    if not wake_tv(45):
+        say("live: телевизор не проснулся")
+        print("телевизор не проснулся", file=sys.stderr)
+        return 1
+    cmd_tv(["app", TV_LIVE])
+    subprocess.run(["sleep", "2"])
+    env = dict(os.environ, DISPLAY=":0", XAUTHORITY=os.path.join(STB_HOME, ".Xauthority"))
+    subprocess.run(["wmctrl", "-c", "Jellyfin Desktop"], env=env, capture_output=True)
+    mode_set("tv")
+    cmd_tv(["speaker-auto"])
+    say("live: режим телевизор")
+    print("перехожу на телевизор")
+    return 0
+
+
+def cmd_toggle(argv):
+    if mode_get() == "tv":
+        say("toggle: → приставка")
+        cmd_box([])
+        return 0
+    say("toggle: → телевизор")
+    cmd_jelly([])
+    return 0
+
+
+# ═══════════════════════════════════════════════════════════ окно, раскладка
+def cmd_close(argv):
+    env = dict(os.environ, DISPLAY=":0", XAUTHORITY=os.path.join(STB_HOME, ".Xauthority"))
+    win = subprocess.run(["xdotool", "getactivewindow"], env=env,
+                         capture_output=True, text=True).stdout.strip()
+    if not win:
+        return 0
+    name = subprocess.run(["xdotool", "getwindowname", win], env=env,
+                          capture_output=True, text=True).stdout
+    if any(word in name for word in ("Приставка", "stb-web", "Mozilla Firefox")):
+        return 0                      # сетку не закрываем
+    subprocess.run(["xdotool", "windowclose", win], env=env, capture_output=True)
+    return 0
+
+
+def cmd_lang(argv):
+    env = dict(os.environ,
+               DISPLAY=":0",
+               XAUTHORITY=os.path.join(STB_HOME, ".Xauthority"),
+               DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/%s/bus" %
+                                        subprocess.run(["id", "-u", STB_USER],
+                                                       capture_output=True, text=True).stdout.strip())
+    what = argv[0] if argv else "status"
+
+    def current():
+        out = subprocess.run(["setxkbmap", "-query"], env=env, capture_output=True, text=True).stdout
+        for line in out.splitlines():
+            if line.startswith("layout:"):
+                return line.split()[1]
+        return ""
+
+    if what == "status":
+        print(current())
+        return 0
+    if what == "toggle":
+        what = "us" if current() == "ru" else "ru"
+    elif what == "en":
+        what = "us"
+    elif what == "ru":
+        pass
+    else:
+        print("usage: stb lang [ru|en|toggle|status]", file=sys.stderr)
+        return 2
+    subprocess.run(["setxkbmap", what], env=env, capture_output=True)
+    print(what)
+    return 0
+
+
+# ═══════════════════════════════════════════════════════════ службы
+def cmd_ctl(argv):
+    what = argv[0] if argv else "status"
+    user = ["sudo", "-n", "-u", STB_USER, "env",
+            "XDG_RUNTIME_DIR=/run/user/%s" % subprocess.run(["id", "-u", STB_USER],
+                                                            capture_output=True, text=True).stdout.strip()]
+
+    def active(unit, is_user=False):
+        cmd = user + ["systemctl", "--user", "is-active", unit] if is_user else \
+              ["systemctl", "is-active", unit]
+        return subprocess.run(cmd, capture_output=True, text=True).stdout.strip() or "—"
+
+    def enabled(unit, is_user=False):
+        cmd = user + ["systemctl", "--user", "is-enabled", unit] if is_user else \
+              ["systemctl", "is-enabled", unit]
+        return subprocess.run(cmd, capture_output=True, text=True).stdout.strip() or "—"
+
+    system = ["stb-tv-link", "stb-wifi-remote", "stb-watch", "stb-nic-watch.timer"]
+    session = ["stb-web", "stb-browser", "stb-screensaver"]
+
+    if what in ("restart", "stop", "start"):
+        if what == "restart":
+            subprocess.run(["systemctl", "restart", "stb.target"])
+            subprocess.run(user + ["systemctl", "--user", "restart", "stb-web", "stb-browser"])
+        elif what == "stop":
+            subprocess.run(user + ["systemctl", "--user", "stop", "stb-browser", "stb-web"])
+            subprocess.run(["systemctl", "stop", "stb.target"])
+        else:
+            subprocess.run(["systemctl", "start", "stb.target"])
+            subprocess.run(user + ["systemctl", "--user", "start", "stb-web", "stb-browser"])
+        subprocess.run(["sleep", "3"])
+
+    print("%-24s %-10s %s" % ("СЛУЖБА", "СОСТОЯНИЕ", "ВКЛЮЧЕНА"))
+    for unit in system:
+        print("%-24s %-10s %s" % (unit, active(unit), enabled(unit)))
+    for unit in session:
+        print("%-24s %-10s %s" % (unit + " (user)", active(unit, True), enabled(unit, True)))
+    return 0
+
+
+# ═══════════════════════════════════════════════════════════ запуск
+# ═══════════════════════════════════════════════════════════ пробуждение и знакомство
+ETHERWAKE = "/usr/sbin/etherwake"
+
+
+def magic():
+    if not TV_MAC:
+        return False
+    try:
+        return subprocess.run(["sudo", ETHERWAKE, "-i", TV_IF, TV_MAC],
+                              capture_output=True, timeout=5).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def awake():
+    return daemon().power() == "Active"
+
+
+def cmd_tv_wake(argv):
+    """Разбудить телевизор и дождаться ответа: stb tv wake [секунды].
+
+    Отметка /run/stb/waking снимается при любом исходе: иначе одно
+    прерванное пробуждение навсегда блокирует кнопку питания с пульта.
+    """
+    limit = int(argv[0]) if argv and argv[0].isdigit() else 45
+    try:
+        if awake():
+            say("wake: уже включён")
+            cmd_tv(["speaker-auto"])
+            return 0
+        started = time.time()
+        for attempt in range(1, 13):
+            magic()
+            if awake():
+                say("wake: проснулся через %d с (попытка %d)"
+                    % (time.time() - started, attempt))
+                cmd_tv(["speaker-auto"])
+                return 0
+            for _ in range(3):
+                time.sleep(1)
+                if awake():
+                    say("wake: проснулся через %d с (попытка %d)"
+                        % (time.time() - started, attempt))
+                    cmd_tv(["speaker-auto"])
+                    return 0
+                if time.time() - started >= limit:
+                    say("wake: не дождались за %d с" % limit)
+                    return 1
+        say("wake: не дождались")
+        return 1
+    finally:
+        try:
+            os.remove("/run/stb/waking")
+        except OSError:
+            pass
+
+
+def cmd_tv_register(argv):
+    """Знакомство с телевизором: подтвердить запрос на его экране (90 с)."""
+    print("== проверка канала до телевизора: %s:%s ==" % (TV, TV_PORT))
+    check = subprocess.run(["curl", "-s", "-i", "-m", "5",
+                            "-H", "Connection: Upgrade", "-H", "Upgrade: websocket",
+                            "-H", "Sec-WebSocket-Version: 13",
+                            "-H", "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==",
+                            "http://%s:%s/" % (TV, TV_PORT)], capture_output=True, text=True)
+    print("\n".join(check.stdout.splitlines()[:3]))
+    print()
+    print("== регистрация: подтвердите запрос на экране телевизора (90 секунд) ==")
+    rc = subprocess.run([sys.argv[0], "tv", "status"], timeout=90).returncode
+    print("exit=%d" % rc)
+    return rc
+
+
+def cmd_tv_learn(argv):
+    """Спариться с телевизором и показать id приложения и входов."""
+    print("== 1. спаривание (на телевизоре нужно нажать «Да») ==")
+    print("   спаривание прошло" if cmd_tv_register([]) == 0
+          else "   спаривание не завершилось — повторите")
+    print("\n== 2. приложение Jellyfin на телевизоре ==")
+    apps = subprocess.run([sys.argv[0], "tv", "getapps"], capture_output=True, text=True).stdout
+    jelly = [line for line in apps.splitlines() if "jelly" in line.lower()]
+    print("\n".join(jelly) if jelly else "   не найдено (проверьте: stb tv getapps)")
+    print("\n== 3. HDMI-входы телевизора ==")
+    inputs = subprocess.run([sys.argv[0], "tv", "getinputs"], capture_output=True, text=True).stdout
+    print(inputs.strip() or "   не удалось получить список")
+    print("\nВпишите найденное в /opt/stb/config/stb.conf:")
+    print("  TV_APP_ID   = id приложения Jellyfin (например org.jellyfin.webos)")
+    print("  TV_INPUT_ID = id входа, на котором сидит коробка (например HDMI_3)")
+    return 0
+
+
+def current_app():
+    """Что сейчас на экране телевизора, одной строкой."""
+    app = daemon().state().get("app")
+    if app:
+        return str(app)
+    return cli_call("get_current_app").stdout.strip().splitlines()[-1] if tv_alive() else ""
+
+
+def cmd_boot(argv):
+    """Хук загрузки: включить телевизор и сесть на вход приставки."""
+    for _ in range(30):
+        if tv_alive():
+            break
+        time.sleep(2)
+
+    state = daemon().power()
+    if state == "Active":
+        say("boot: телевизор уже включён — пробуждение не требуется")
+    elif cmd_tv_wake(["40"]) != 0:
+        say("boot: телевизор не ответил — интерфейс поднимет сторож")
+        return 0
+    else:
+        say("boot: телевизор проснулся")
+
+    if TV_INPUT:
+        cmd_tv(["setinput", TV_INPUT])
+        say("boot: вход переключён на %s" % TV_INPUT)
+    mode_set("nuc")
+    subprocess.run(["/opt/stb/bin/stb-idle", "on"], capture_output=True, timeout=60)
+    return 0
+
+
+def cmd_tv_shutdown(argv):
+    """Хук выключения приставки: погасить телевизор, если смотрели приставку."""
+    jobs = subprocess.run(["systemctl", "list-jobs", "--no-pager"],
+                          capture_output=True, text=True).stdout
+    if "reboot.target" in jobs:
+        say("shutdown: перезагрузка — телевизор не гашу")
+        return 0
+    if not tv_alive():
+        say("shutdown: телевизор уже не в сети")
+        return 0
+    if mode_get() == "nuc":
+        if cmd_tv(["off"]) == 0:
+            say("shutdown: телевизор погашен")
+    else:
+        say("shutdown: режим tv — телевизор оставляю включённым")
+    return 0
+
+
+def cmd_preflight(argv):
+    """Профилактика в режиме ТВ: вернуть Jellyfin, если телевизор упал или на «кабеле».
+
+    Запускается из обработчика кнопок в фоне, не чаще раза в 15 секунд.
+    """
+    last = "/run/stb/preflight.last"
+    try:
+        age = time.time() - os.path.getmtime(last)
+        if age < 15:
+            return 0
+    except OSError:
+        pass
+    try:
+        open(last, "w", encoding="utf-8").close()
+    except OSError:
+        return 0
+
+    app = current_app()
+    if not app:
+        say("preflight: ТВ не отвечает — бужу")
+        if cmd_tv_wake(["30"]) != 0:
+            say("preflight: разбудить не удалось")
+            return 0
+        for attempt in range(1, 4):
+            if TV_APP:
+                cmd_tv(["app", TV_APP])
+            time.sleep(2)
+            if TV_APP and TV_APP in current_app():
+                say("preflight: проснулся и запустил приложение (попытка %d)" % attempt)
+                return 0
+        say("preflight: проснулся, но приложение не вышло")
+    return 0
+
+
+# ═══════════════════════════════════════════════════════════ текст и настройки ТВ
+def _text_args(argv):
+    """--enter, --delete N, «--» и дальше текст (иначе дефисы съест разбор опций)."""
+    enter = "--enter" in argv
+    args = [a for a in argv if a != "--enter"]
+    if "--" in args:
+        sep = args.index("--")
+        text = " ".join(args[sep + 1:]) if len(args) > sep + 1 else None
+        return text, enter, 0
+    if args and args[0] == "--delete":
+        try:
+            return None, enter, int(args[1])
+        except (IndexError, ValueError):
+            raise SystemExit("после --delete нужно число символов") from None
+    if args and args[0].startswith("--"):
+        raise SystemExit("неизвестная опция %s; для текста используйте «--»" % args[0])
+    return (args[0] if args else None), enter, 0
+
+
+parse_args = _text_args      # имя для тестов
+
+
+def cmd_tv_text(argv):
+    """Текст в приложение телевизора через внутренний сервис ввода webOS."""
+    import asyncio
+    import glob
+
+    for extra in glob.glob(os.path.join(STB_HOME, "tvctl", "lib", "python3*", "site-packages")):
+        sys.path.insert(0, extra)
+    import bscpylgtv
+
+    try:
+        text, enter, delete = _text_args(argv)
+    except SystemExit as exc:
+        print(json.dumps({"ok": False, "msg": str(exc)}, ensure_ascii=False))
+        return 2
+    if text is None and not enter and not delete:
+        print(json.dumps({"ok": False, "msg": "нужен текст, --enter или --delete N"}, ensure_ascii=False))
+        return 2
+
+    async def send():
+        client = await bscpylgtv.WebOsClient.create(
+            TV, key_file_path=os.path.join(STB_HOME, ".aiopylgtv.sqlite"),
+            manifest_file_path=os.path.join(TVCTL, "nuc_manifest.json"), states=[])
+        await client.connect()
+        try:
+            if delete:
+                await asyncio.wait_for(client.request(
+                    "luna://com.webos.service.ime/deleteCharacters", {"count": int(delete)}), 10)
+            if text:
+                await asyncio.wait_for(client.request(
+                    "luna://com.webos.service.ime/insertText", {"text": text, "replace": 0}), 10)
+            if enter:
+                await asyncio.wait_for(client.request(
+                    "luna://com.webos.service.ime/sendEnterKey", {"text": ""}), 10)
+        finally:
+            await client.close()
+
+    try:
+        asyncio.run(send())
+    except Exception as exc:  # noqa: BLE001
+        print(json.dumps({"ok": False, "msg": repr(exc)[:200]}, ensure_ascii=False))
+        return 1
+    what = text or ("стереть %d" % delete if delete else "")
+    print(json.dumps({"ok": True, "msg": "отправлено: %s%s" % (what, " + Enter" if enter else "")},
+                     ensure_ascii=False))
+    return 0
+
+
+def cmd_tv_setting(argv):
+    """Системные настройки телевизора: stb tv setting get|set КЛЮЧ [ЗНАЧЕНИЕ]."""
+    return subprocess.run([PY, "/opt/stb/lib/tv_setting.py"] + list(argv)).returncode
+
+
+# ═══════════════════════════════════════════════════════════ масштаб страниц
+ZOOM_SITES = {"misc": "misc.local", "youtube": "www.youtube.com", "google": "www.google.com"}
+ZOOM_DB = os.path.join(STB_HOME, ".mozilla/stb/content-prefs.sqlite")
+
+
+def _zoom_conn(path):
+    import sqlite3
+    con = sqlite3.connect(path)
+    cur = con.cursor()
+    cur.execute("select id from settings where name='zoom-zoom'")
+    row = cur.fetchone()
+    if row:
+        sid = row[0]
+    else:
+        cur.execute("insert into settings(name) values('zoom-zoom')")
+        sid = cur.lastrowid
+    return con, cur, sid
+
+
+def _zoom_group(cur, host):
+    cur.execute("select id from groups where name=?", (host,))
+    row = cur.fetchone()
+    if row:
+        return row[0]
+    cur.execute("insert into groups(name) values(?)", (host,))
+    return cur.lastrowid
+
+
+def user_systemctl(*args):
+    """systemctl --user от имени пользователя приставки."""
+    import pwd
+    uid = pwd.getpwnam(STB_USER).pw_uid
+    return subprocess.run(["sudo", "-n", "-u", STB_USER, "env",
+                           "XDG_RUNTIME_DIR=/run/user/%d" % uid,
+                           "systemctl", "--user", *args],
+                          capture_output=True, timeout=30)
+
+
+def cmd_zoom(argv):
+    """Масштаб страниц по сайтам: stb zoom [misc|youtube|google] [проценты]."""
+    import shutil
+    import tempfile
+
+    if not argv:
+        tmp = os.path.join(tempfile.gettempdir(), "stb-zoom-read.sqlite")
+        try:
+            shutil.copy2(ZOOM_DB, tmp)
+        except OSError:
+            tmp = ZOOM_DB
+        con, cur, sid = _zoom_conn(tmp)
+        print("текущий масштаб:")
+        for key, host in ZOOM_SITES.items():
+            cur.execute("select id from groups where name=?", (host,))
+            row = cur.fetchone()
+            value = None
+            if row:
+                cur.execute("select value from prefs where groupID=? and settingID=?", (row[0], sid))
+                got = cur.fetchone()
+                value = got[0] if got else None
+            print("  %-8s %-18s %s" % (key, host, value if value else "по умолчанию (100)"))
+        con.close()
+        return 0
+
+    if len(argv) == 1 and argv[0].isdigit():
+        key, percent = "misc", int(argv[0])
+    elif len(argv) == 2 and argv[0] in ZOOM_SITES and argv[1].isdigit():
+        key, percent = argv[0], int(argv[1])
+    else:
+        print("usage: stb zoom [misc|youtube|google] ПРОЦЕНТЫ", file=sys.stderr)
+        return 2
+    if not 50 <= percent <= 400:
+        print("масштаб задавать в процентах, от 50 до 400", file=sys.stderr)
+        return 2
+
+    user_systemctl("stop", "stb-browser")
+    time.sleep(3)
+    host = ZOOM_SITES[key]
+    con, cur, sid = _zoom_conn(ZOOM_DB)
+    gid = _zoom_group(cur, host)
+    cur.execute("select value from prefs where groupID=? and settingID=?", (gid, sid))
+    old = cur.fetchone()
+    if old:
+        cur.execute("update prefs set value=?, timestamp=? where groupID=? and settingID=?",
+                    (percent, int(time.time()), gid, sid))
+    else:
+        cur.execute("insert into prefs(groupID, settingID, value, timestamp) values(?,?,?,?)",
+                    (gid, sid, percent, int(time.time())))
+    con.commit()
+    con.close()
+    print("  %s: %s → %d%%" % (host, old[0] if old else "—", percent))
+    user_systemctl("start", "stb-browser")
+    return 0
+
+
+# ═══════════════════════════════════════════════════════════ кнопки
+KEYS_LOG = "/var/log/stb/keys.log"
+XDISPLAY = {"DISPLAY": ":0"}
+
+
+def key_log(msg):
+    line = "%s.%03d [%s] %s\n" % (
+        time.strftime("%F %T"), int(time.time() * 1000) % 1000, mode_get(), msg)
+    try:
+        with open(KEYS_LOG, "a", encoding="utf-8") as f:
+            f.write(line)
+        with open("/run/stb/lastkey", "w", encoding="utf-8") as f:
+            f.write(line.strip())
+    except OSError:
+        pass
+
+
+def xdo(*args):
+    env = dict(os.environ, **XDISPLAY,
+               XAUTHORITY=os.path.join(STB_HOME, ".Xauthority"))
+    return subprocess.run(["xdotool"] + list(args), env=env,
+                          capture_output=True, text=True, timeout=20)
+
+
+def window_title():
+    return xdo("getactivewindow", "getwindowname").stdout.strip()
+
+
+def on_grid():
+    return "Приставка" in window_title()
+
+
+def scroll_key(grid_key, scroll):
+    if on_grid():
+        xdo("key", "--clearmodifiers", grid_key)
+        key_log("%s (сетка)" % grid_key)
+    else:
+        xdo("key", "--clearmodifiers", scroll)
+        key_log("прокрутка %s" % scroll)
+
+
+def debounce(name, seconds):
+    stamp = "/run/stb/%s.stamp" % name
+    try:
+        last = float(open(stamp, encoding="utf-8").read().strip())
+    except (OSError, ValueError):
+        last = 0.0
+    now = time.time()
+    if now - last < seconds:
+        key_log("%s: пропуск (дребезг, %s с)" % (name, seconds))
+        return False
+    try:
+        with open(stamp, "w", encoding="utf-8") as f:
+            f.write(str(now))
+    except OSError:
+        pass
+    return True
+
+
+def key_power():
+    if not debounce("power", 2):
+        return 0
+    if awake():
+        key_log("power → ТВ off")
+        subprocess.Popen([sys.argv[0], "tv", "off"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, encoding="utf-8")
+        return 0
+    flag = "/run/stb/waking"
+    WAKE_FLAG_MAX = 60      # будим не дольше 40 с; старая отметка — мусор
+    if os.path.exists(flag):
+        age = time.time() - os.path.getmtime(flag)
+        if age < WAKE_FLAG_MAX:
+            key_log("power: включение уже идёт (%.0f с назад)" % age)
+            return 0
+        key_log("power: старая отметка включения (%.0f с) — убираю" % age)
+        try:
+            os.remove(flag)
+        except OSError:
+            pass
+    key_log("power → ТВ on")
+    open("/run/stb/waking", "w", encoding="utf-8").close()
+    subprocess.Popen([sys.argv[0], "tv", "wake", "40"],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, encoding="utf-8")
+    return 0
+
+
+def key_back():
+    if mode_get() == "tv":
+        key_log("back → ТВ")
+        return cmd_tv(["key", "BACK"])
+    title = window_title()
+    if "Mozilla" in title:
+        before = title
+        xdo("key", "--clearmodifiers", "alt+Left")
+        time.sleep(0.6)
+        after = window_title()
+        if before == after:
+            if "Приставка" in after:
+                key_log("back → это сетка, назад некуда")
+            else:
+                key_log("back → истории нет, закрываю вкладку")
+                xdo("key", "--clearmodifiers", "ctrl+w")
+        else:
+            key_log("back → шаг назад в браузере")
+        return 0
+    key_log("back → закрыть окно (%s)" % title)
+    return cmd_close([])
+
+
+def key_home():
+    if mode_get() == "tv":
+        key_log("home → меню телевизора")
+        return cmd_tv(["key", "HOME"])
+    app = current_app()
+    if app and "hdmi" not in app.lower():
+        key_log("home: возвращаю вход ТВ")
+        if TV_INPUT:
+            cmd_tv(["setinput", TV_INPUT])
+    mode_set("nuc")
+    env = dict(os.environ, **XDISPLAY, XAUTHORITY=os.path.join(STB_HOME, ".Xauthority"))
+    subprocess.run(["wmctrl", "-a", "Mozilla Firefox"], env=env, capture_output=True)
+    time.sleep(0.2)
+    for _ in range(8):
+        if "Приставка" in window_title():
+            break
+        xdo("key", "--clearmodifiers", "ctrl+Page_Up")
+        time.sleep(0.35)
+    key_log("home → на сетку")
+    return 0
+
+
+KEY_ACTIONS = {
+    "power", "volup", "voldown", "mute", "back", "home", "menu", "tobox",
+    "ok", "up", "down", "left", "right", "prev", "next",
+    "play", "playkey", "pausekey", "chup", "chdown",
+    "red", "green", "yellow", "blue", "info", "guide", "cc", "exit",
+} | {str(d) for d in range(10)}
+
+
+def cmd_key(argv):
+    """Кнопка пульта с учётом режима: stb key <действие>."""
+    act = (argv[0] if argv else "").strip()
+    if not act:
+        print("usage: stb key <power|volup|voldown|mute|back|home|menu|ok|up|down|"
+              "left|right|chup|chdown|red|green|yellow|blue|info|guide|cc|exit|"
+              "prev|play|playkey|pausekey|next>", file=sys.stderr)
+        return 2
+
+    if act not in KEY_ACTIONS:
+        print("неизвестное действие: %s" % act, file=sys.stderr)
+        return 2
+
+    mode = mode_get()
+    if mode == "tv":
+        subprocess.Popen([sys.argv[0], "preflight"],
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, encoding="utf-8")
+
+    tv = mode == "tv"
+    simple_tv = {"volup": ("VOLUMEUP", "vol+"), "voldown": ("VOLUMEDOWN", "vol−"),
+                 "mute": ("MUTE", "mute"), "info": ("INFO", "info"),
+                 "guide": ("GUIDE", "guide"), "cc": ("CC", "субтитры"),
+                 "chup": ("CHANNELUP", "канал +"), "chdown": ("CHANNELDOWN", "канал −")}
+
+    if act == "power":
+        return key_power()
+    if act in simple_tv:
+        key_name, label = simple_tv[act]
+        key_log(label)
+        return cmd_tv(["key", key_name]) if tv else 0
+    if act == "back":
+        return key_back()
+    if act == "tobox":
+        key_log("на приставку")
+        if TV_INPUT:
+            cmd_tv(["setinput", TV_INPUT])
+        mode_set("nuc")
+        env = dict(os.environ, **XDISPLAY, XAUTHORITY=os.path.join(STB_HOME, ".Xauthority"))
+        subprocess.run(["wmctrl", "-a", "Mozilla Firefox"], env=env, capture_output=True)
+        return 0
+    if act == "home":
+        return key_home()
+    if act == "menu":
+        if tv:
+            key_log("menu → ТВ")
+            return cmd_tv(["key", "MENU"])
+        key_log("menu → Escape")
+        xdo("key", "--clearmodifiers", "Escape")
+        return 0
+    if act in ("up", "down"):
+        if tv:
+            key_log("%s → ТВ (%s)" % (act, "вверх" if act == "up" else "вниз"))
+            return cmd_tv(["key", act.upper()])
+        scroll_key("Up" if act == "up" else "Down", "Prior" if act == "up" else "Next")
+        return 0
+    if act in ("left", "right", "prev", "next"):
+        key_name = {"left": "LEFT", "prev": "LEFT", "right": "RIGHT", "next": "RIGHT"}[act]
+        if tv:
+            key_log("%s → ТВ %s" % (act, "влево" if key_name == "LEFT" else "вправо"))
+            return cmd_tv(["key", key_name])
+        key_log("%s → %s" % (act, "влево" if key_name == "LEFT" else "вправо"))
+        xdo("key", "--clearmodifiers", "Left" if key_name == "LEFT" else "Right")
+        return 0
+    if act in ("play", "ok", "playkey", "pausekey"):
+        if tv:
+            key_name = {"play": "ENTER", "ok": "ENTER", "playkey": "PLAY", "pausekey": "PAUSE"}[act]
+            key_log("%s → ТВ %s" % (act, key_name))
+            return cmd_tv(["key", key_name])
+        key_log("%s → выбор плитки" % act)
+        xdo("key", "--clearmodifiers", "Return")
+        return 0
+    if act in ("red", "green", "yellow", "blue"):
+        colour = act.upper()
+        if tv:
+            key_log("цветная: %s → ТВ" % colour)
+            return cmd_tv(["key", colour])
+        key_log("цветная: %s (в приставке не назначена)" % colour)
+        return 0
+    if act == "exit":
+        key_log("exit" if not tv else "exit → ТВ")
+        return cmd_tv(["key", "EXIT"]) if tv else 0
+    if act.isdigit() and len(act) == 1:
+        if tv:
+            key_log("цифра %s → ТВ" % act)
+            return cmd_tv(["key", act])
+        key_log("цифра %s" % act)
+        xdo("key", "--clearmodifiers", act)
+        return 0
+
+    print("неизвестное действие: %s" % act, file=sys.stderr)
+    return 2
+
+
+# ═══════════════════════════════════════════════════════════ справка
+HELP = {
+    "tv": ("управление телевизором LG", [
+        ("stb tv on", "разбудить телевизор пакетом WoL"),
+        ("stb tv off", "погасить телевизор"),
+        ("stb tv powerstate", "состояние питания: Active / Screen Off / Suspend"),
+        ("stb tv status", "звук и приложение на экране"),
+        ("stb tv key ИМЯ",
+         "кнопка телевизора: UP, DOWN, LEFT, RIGHT, ENTER, BACK, MENU, HOME, EXIT,"
+         " PLAY, PAUSE, VOLUMEUP, MUTE, CC, INFO, GUIDE, RED…"),
+        ("stb tv up | down", "громкость больше / меньше"),
+        ("stb tv mute | unmute", "выключить / вернуть звук"),
+        ("stb tv vol ЧИСЛО", "громкость числом, 0–100"),
+        ("stb tv setinput ИМЯ", "вход, например HDMI_3"),
+        ("stb tv getinputs", "список входов"),
+        ("stb tv app ID", "запустить приложение, например org.jellyfin.webos"),
+        ("stb tv getapps", "список приложений без системных"),
+        ("stb tv speakers", "какой выход звука сейчас и какие бывают"),
+        ("stb tv speaker ID", "переключить выход звука"),
+        ("stb tv speaker-auto", "вернуть выход из конфига, если сбился"),
+        ("stb tv text ТЕКСТ",
+         "отправить текст в приложение (--enter, --delete N,"
+         " «--» перед текстом с дефисами)"),
+        ("stb tv setting get|set КЛЮЧ [ЗНАЧЕНИЕ]", "системные настройки телевизора"),
+        ("stb tv wake [СЕКУНД]", "будить и ждать, пока ответит (по умолчанию 45 с)"),
+        ("stb tv register", "знакомство с телевизором: подтвердить запрос на экране"),
+        ("stb tv learn", "знакомство + подсказать id приложения и входов"),
+        ("stb tv shutdown", "хук выключения приставки: погасить телевизор"),
+    ]),
+    "mode": ("режим пульта: приставка или телевизор", [
+        ("stb mode", "показать текущий режим (nuc или tv)"),
+        ("stb mode nuc", "пульт управляет приставкой, работает заставка"),
+        ("stb mode tv", "пульт управляет телевизором, заставка выключена"),
+    ]),
+    "toggle": ("переключить приставка ↔ телевизор", [
+        ("stb toggle",
+         "в режиме приставки — включает телевизор с Jellyfin,"
+         " в режиме ТВ — возвращает на приставку"),
+    ]),
+    "live": ("перейти на эфир телевизора", [
+        ("stb live", "будит телевизор, включает его эфир и переводит пульт в режим ТВ"),
+    ]),
+    "box": ("вернуться на приставку", [
+        ("stb box", "переключить телевизор на вход приставки и режим nuc"),
+    ]),
+    "jelly": ("Jellyfin на телевизоре", [
+        ("stb jelly", "будит телевизор, запускает приложение Jellyfin, режим ТВ"),
+    ]),
+    "close": ("окно браузера", [
+        ("stb close", "закрыть активное окно; сетку и сам браузер не трогает"),
+    ]),
+    "key": ("кнопка пульта", [
+        ("stb key ДЕЙСТВИЕ",
+         "power, volup, voldown, mute, back, home, menu, tobox, ok, up, down,"
+         " left, right, prev, next, play, playkey, pausekey, chup, chdown,"
+         " red, green, yellow, blue, info, guide, cc, exit, цифры"),
+    ]),
+    "lang": ("раскладка клавиатуры приставки", [
+        ("stb lang status", "какая раскладка сейчас"),
+        ("stb lang ru | en", "включить русскую или английскую"),
+        ("stb lang toggle", "переключить"),
+    ]),
+    "zoom": ("масштаб страниц в браузере", [
+        ("stb zoom", "показать текущие масштабы"),
+        ("stb zoom misc 200", "масштаб домашних сервисов, проценты"),
+        ("stb zoom youtube 130", "масштаб YouTube"),
+        ("stb zoom 180", "то же, что «misc 180»"),
+    ]),
+    "ctl": ("службы комплекса", [
+        ("stb ctl status", "таблица: что запущено и включено"),
+        ("stb ctl restart", "перезапустить весь комплекс"),
+        ("stb ctl stop | start", "остановить / запустить"),
+    ]),
+    "boot": ("хук загрузки", [
+        ("stb boot", "включить телевизор, выбрать вход приставки, поднять интерфейс"),
+    ]),
+    "preflight": ("профилактика в режиме ТВ", [
+        ("stb preflight",
+         "вернуть Jellyfin, если телевизор упал на «кабель»;"
+         " сам себя ограничивает раз в 15 с"),
+    ]),
+    "pair": ("сопряжение телефона-пульта", [
+        ("stb pair [СЕКУНДЫ]", "открыть окно сопряжения (по умолчанию 180 с)"),
+        ("stb pair scan [СЕКУНДЫ]", "посмотреть, что видно в эфире"),
+        ("stb pair list", "что сопряжено и что подключено"),
+        ("stb pair connect ИМЯ|MAC", "найти телефон и подключиться"),
+    ]),
+    "keys": ("карты кнопок", [
+        ("stb keys apply bt", "собрать ~/.xbindkeysrc из buttons-bt.conf и перезапустить xbindkeys"),
+        ("stb keys apply bt --dry-run", "только показать, что получится"),
+        ("stb keys apply wifi", "применить buttons-wifi.conf (перезапуск приёмника)"),
+    ]),
+    "idle": ("лёгкий режим", [
+        ("stb idle off", "телевизор выключен: браузер и плеер закрыты, процессор в powersave"),
+        ("stb idle on", "телевизор включён: браузер и звук обратно"),
+    ]),
+    "screen": ("заставка", [
+        ("stb screen on", "гасить экран после простоя в режиме приставки"),
+        ("stb screen off", "не гасить (режим телевизора)"),
+        ("stb screen status", "состояние, порог и текущий простой"),
+        ("stb screensaver", "сам сторож простоя (служба пользователя)"),
+    ]),
+    "browser": ("браузер приставки", [
+        ("stb browser", "Firefox окном на весь экран; служба stb-browser"),
+    ]),
+    "session": ("графическая сессия", [
+        ("stb session", "openbox, уведомления, привязки, браузер; запускается при входе"),
+    ]),
+    "nic-watch": ("сетевой чип", [
+        ("stb nic-watch", "сбросить линк, если в dmesg новые зависания чипа (таймер)"),
+    ]),
+    "player": ("плеер на приставке", [
+        ("stb player", "Jellyfin Desktop на приставке (не на телевизоре)"),
+        ("stb player --status", "есть ли у плеера окно и какие висят процессы"),
+        ("stb player --kill", "погасить плеер целиком (включая зависший без окна)"),
+    ]),
+    "poweroff": ("выключить приставку", [
+        ("stb poweroff", "первое нажатие взводит, второе в течение 10 с выключает приставку"),
+        ("stb poweroff --now", "выключить сразу, без подтверждения"),
+    ]),
+    "screensaver": ("сторож простоя", [
+        ("stb screensaver", "сам сторож: открывает чёрную вкладку по простою и закрывает по нажатию"),
+    ]),
+    "help": ("эта справка", [
+        ("stb help", "список разделов"),
+        ("stb help tv", "подробно про раздел"),
+        ("stb help --markdown", "та же справка в markdown — из неё собирается docs/COMMANDS.md"),
+    ]),
+}
+
+
+def help_text(topic=None):
+    if topic and topic in HELP:
+        title, rows = HELP[topic]
+        out = ["stb %s — %s" % (topic, title), ""]
+        for usage, what in rows:
+            out.append("  %-46s %s" % (usage, what))
+        return "\n".join(out)
+    out = ["stb — одна команда для приставки", "", "Разделы:"]
+    for name, (title, _rows) in HELP.items():
+        out.append("  %-10s %s" % (name, title))
+    out += ["", "Подробнее: stb help <раздел>, например stb help tv",
+            "Короткое имя: tv — то же, что stb tv"]
+    return "\n".join(out)
+
+
+def help_markdown():
+    """Та же справка в markdown: docs/COMMANDS.md собирается из неё."""
+    out = ["# Команды `stb`", "",
+           "Документ собран из самой программы: `stb help --markdown`.", ""]
+    for name, (title, rows) in HELP.items():
+        out.append("## %s — %s" % (name, title))
+        out.append("")
+        out.append("| команда | что делает |")
+        out.append("|---|---|")
+        for usage, what in rows:
+            out.append("| `%s` | %s |" % (usage.replace("|", "\\|"), what))
+        out.append("")
+    return "\n".join(out)
+
+
+def cmd_help(argv):
+    if argv and argv[0] == "--markdown":
+        print(help_markdown())
+        return 0
+    print(help_text(argv[0] if argv else None))
+    return 0
+
+
+# ═══════════════════════════════════════════════════════════ Bluetooth-пульт
+PAIR_LOG = "/var/log/stb/pair.log"
+CONFIG_DIR = stbconf.get("STB_CONFIG_DIR", "/opt/stb/config")
+
+
+def pair_log(msg):
+    line = "%s %s" % (time.strftime("%F %T"), msg)
+    try:
+        with open(PAIR_LOG, "a", encoding="utf-8") as f:
+            f.write(line + "\n")
+    except OSError:
+        pass
+    print(line)
+
+
+def bt(*args, timeout=30):
+    try:
+        return subprocess.run(["bluetoothctl"] + list(args), capture_output=True,
+                              text=True, timeout=timeout)
+    except (OSError, subprocess.SubprocessError):
+        return subprocess.CompletedProcess(["bluetoothctl"], 1, stdout="", stderr="")
+
+
+def bt_power():
+    bt("power", "on")
+    bt("pairable", "on")
+
+
+def pair_window(seconds):
+    bt_power()
+    bt("discoverable-timeout", str(seconds))
+    bt("discoverable", "on")
+    show = bt("show").stdout
+    name = ""
+    for line in show.splitlines():
+        if line.strip().startswith("Name:"):
+            name = line.split(":", 1)[1].strip()
+            break
+    if "Discoverable: yes" not in show:
+        pair_log("не удалось включить видимость — проверьте bluetooth.service")
+        return 1
+    os.makedirs("/run/stb", exist_ok=True)
+    with open("/run/stb/pair_until", "w", encoding="utf-8") as f:
+        f.write(str(int(time.time()) + seconds))
+    pair_log("видим как «%s» %d с — сопрягайте телефон" % (name, seconds))
+    # погасить видимость по времени
+    subprocess.Popen(["/bin/sh", "-c",
+                      "sleep %d; bluetoothctl discoverable off >/dev/null 2>&1;"
+                      " rm -f /run/stb/pair_until" % seconds],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, encoding="utf-8")
+    paired = bt("devices", "Paired").stdout.replace("Device ", "").split("\n")
+    pair_log("уже сопряжены: %s" % " ".join(x.strip() for x in paired if x.strip()))
+    return 0
+
+
+def bt_find(want):
+    if ":" in want:
+        return want.upper()
+    for line in bt("devices").stdout.splitlines():
+        parts = line.split(" ", 2)
+        if len(parts) < 3:
+            continue
+        mac, name = parts[1], parts[2]
+        if want.lower() in name.lower():
+            return mac
+    return ""
+
+
+def pair_scan(seconds):
+    bt_power()
+    pair_log("ищу устройства %d с…" % seconds)
+    bt("--timeout", str(seconds), "scan", "on", timeout=seconds + 10)
+    print("  найдено:")
+    for line in bt("devices").stdout.splitlines():
+        print("    " + line)
+    pair_log("поиск завершён")
+    return 0
+
+
+def pair_list():
+    print("  сопряжены:")
+    for line in bt("devices", "Paired").stdout.splitlines():
+        print("    " + line)
+    print("  подключены сейчас:")
+    for line in bt("devices", "Connected").stdout.splitlines():
+        print("    " + line)
+    return 0
+
+
+def pair_connect(who):
+    if not who:
+        print("укажи имя или MAC: stb pair connect IgChe", file=sys.stderr)
+        return 2
+    bt_power()
+    mac = bt_find(who)
+    if not mac:
+        pair_log("«%s» пока не видно — ищу 20 секунд" % who)
+        bt("--timeout", "20", "scan", "on", timeout=30)
+        mac = bt_find(who)
+    if not mac:
+        pair_log("не нашёл «%s»: запустите сопряжение на телефоне; список — stb pair scan 20" % who)
+        return 1
+    pair_log("нашёл: %s" % mac)
+    if "Paired: yes" not in bt("info", mac).stdout:
+        pair_log("сопрягаю (на телефоне может появиться запрос)")
+        out = bt("pair", mac, timeout=60).stdout.strip().splitlines()
+        print("\n".join("  " + line for line in out[-2:]))
+    bt("trust", mac)
+    pair_log("подключаюсь")
+    out = bt("connect", mac, timeout=60).stdout.strip().splitlines()
+    print("\n".join("  " + line for line in out[-2:]))
+    time.sleep(2)
+    if "Connected: yes" in bt("info", mac).stdout:
+        pair_log("подключено: %s" % mac)
+        try:
+            with open("/var/lib/stb/bt-remotes", "a", encoding="utf-8") as f:
+                f.write(mac + "\n")
+            lines = sorted(set(open("/var/lib/stb/bt-remotes", encoding="utf-8").read().split()))
+            with open("/var/lib/stb/bt-remotes", "w", encoding="utf-8") as f:
+                f.write("\n".join(x for x in lines if x) + "\n")
+        except OSError:
+            pass
+        return 0
+    pair_log("подключиться не удалось: stb pair scan 30, затем stb pair connect <MAC>")
+    return 1
+
+
+def cmd_pair(argv):
+    """Окно сопряжения и поиск телефона-пульта."""
+    if not argv:
+        return pair_window(180)
+    what = argv[0]
+    if what.isdigit():
+        return pair_window(int(what))
+    if what in ("scan", "-s"):
+        return pair_scan(int(argv[1]) if len(argv) > 1 and argv[1].isdigit() else 30)
+    if what in ("list", "-l"):
+        return pair_list()
+    if what in ("connect", "-c"):
+        return pair_connect(argv[1] if len(argv) > 1 else "")
+    if what in ("-h", "--help"):
+        return cmd_help(["pair"])
+    print("usage: stb pair [секунды] | stb pair scan [секунды] | stb pair list | "
+          "stb pair connect ИМЯ|MAC", file=sys.stderr)
+    return 2
+
+
+# ═══════════════════════════════════════════════════════════ карты кнопок
+def bt_keys_apply(dry_run=False):
+    """Собрать ~/.xbindkeysrc из карты BT и перезапустить xbindkeys."""
+    maps = os.path.join(CONFIG_DIR, "buttons-bt.conf")
+    target = os.path.join(STB_HOME, ".xbindkeysrc")
+    if not os.access(maps, os.R_OK):
+        print("нет файла %s" % maps, file=sys.stderr)
+        return 1
+
+    body = ["# Собрано из %s — правьте карту, а не этот файл." % maps,
+            "# Применить: stb keys apply bt", ""]
+    for raw in open(maps, encoding="utf-8"):
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, action = line.split("=", 1)
+        key, action = key.replace(" ", ""), action.split("#")[0].strip()
+        if not key or not action:
+            continue
+        body += ['"/opt/stb/bin/stb key %s"' % action, "    %s" % key, ""]
+
+    text = "\n".join(body)
+    if dry_run:
+        print(text)
+        return 0
+
+    with open(target, "w", encoding="utf-8") as f:
+        f.write(text)
+    subprocess.run(["chown", "%s:%s" % (STB_USER, STB_USER), target], capture_output=True)
+    print("собрано привязок: %d" % sum(1 for line in body if line.startswith('"')))
+
+    import pwd
+    uid = pwd.getpwnam(STB_USER).pw_uid
+    env_prefix = ["sudo", "-n", "-u", STB_USER, "env", "DISPLAY=:0",
+                  "XAUTHORITY=%s" % os.path.join(STB_HOME, ".Xauthority"),
+                  "HOME=%s" % STB_HOME, "XDG_RUNTIME_DIR=/run/user/%d" % uid]
+    subprocess.run(env_prefix + ["pkill", "-x", "xbindkeys"], capture_output=True)
+    time.sleep(1)
+    subprocess.Popen(env_prefix + ["setsid", "xbindkeys"],
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                     stdin=subprocess.DEVNULL, encoding="utf-8")
+    time.sleep(1)
+    count = subprocess.run(["pgrep", "-c", "-x", "xbindkeys"], capture_output=True,
+                           text=True).stdout.strip()
+    print("xbindkeys: %s процесс(ов)" % (count or 0))
+    return 0
+
+
+def cmd_keys(argv):
+    """Карты кнопок: stb keys apply bt [--dry-run] | stb keys apply wifi."""
+    if len(argv) < 2 or argv[0] != "apply":
+        print("usage: stb keys apply bt [--dry-run] | stb keys apply wifi", file=sys.stderr)
+        return 2
+    what = argv[1]
+    if what == "bt":
+        return bt_keys_apply("--dry-run" in argv)
+    if what == "wifi":
+        rc = subprocess.run(["systemctl", "restart", "stb-wifi-remote"]).returncode
+        print("карта buttons-wifi.conf применена: приёмник перезапущен")
+        return rc
+    print("неизвестная карта: %s" % what, file=sys.stderr)
+    return 2
+
+
+# ═══════════════════════════════════════════════════════════ общие помощники сессии
+def user_env():
+    import pwd
+    uid = pwd.getpwnam(STB_USER).pw_uid
+    return dict(os.environ, HOME=STB_HOME, DISPLAY=":0",
+                XAUTHORITY=os.path.join(STB_HOME, ".Xauthority"),
+                XDG_RUNTIME_DIR="/run/user/%d" % uid,
+                DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/%d/bus" % uid)
+
+
+def as_user(*args, **kwargs):
+    """Выполнить от имени пользователя приставки (если мы root)."""
+    if os.getuid() == 0:
+        return subprocess.run(["sudo", "-n", "-u", STB_USER, "env"] +
+                              ["%s=%s" % (k, v) for k, v in user_env().items()
+                               if k in ("HOME", "DISPLAY", "XAUTHORITY", "XDG_RUNTIME_DIR",
+                                        "DBUS_SESSION_BUS_ADDRESS")] + list(args),
+                              capture_output=True, text=True, timeout=kwargs.get("timeout", 40))
+    return subprocess.run(list(args), env=user_env(),
+                          capture_output=True, text=True, timeout=kwargs.get("timeout", 40))
+
+
+# ═══════════════════════════════════════════════════════════ лёгкий режим
+def idle_log(msg):
+    """Строка в журнал лёгкого режима (общий и для cmd_idle, и для подъёма окна)."""
+    line = "%s %s\n" % (time.strftime("%F %T"), msg)
+    try:
+        with open("/var/log/stb/idle.log", "a", encoding="utf-8") as f:
+            f.write(line)
+    except OSError:
+        pass
+
+
+def show_browser():
+    """Показать готовое окно браузера: развернуть и вывести вперёд.
+
+    Возвращает True, если окно уже существует и показано.
+    """
+    windows = browser_windows()
+    if not windows:
+        return False
+    wid = windows[0].split()[0]
+    as_user("wmctrl", "-i", "-a", wid)
+    as_user("wmctrl", "-i", "-r", wid, "-b", "add,maximized_vert,maximized_horz")
+    as_user("xdotool", "windowactivate", "--sync", wid)
+    return True
+
+
+def browser_windows():
+    """Есть ли окно браузера: список окон openbox."""
+    out = as_user("wmctrl", "-l").stdout.strip()
+    return [line for line in out.splitlines() if "Mozilla" in line or "Приставка" in line]
+
+
+def ensure_browser():
+    """Гарантировать окно браузера.
+
+    Прежний Firefox после остановки службы может ещё держать профиль;
+    если запустить новый сразу, он молча выходит без окна. Поэтому:
+    остановить, дождаться, пока процесс уйдёт, снять замки, запустить,
+    проверить окно и повторить при неудаче.
+    """
+    # Сначала даём браузеру время: Firefox поднимает окно 10–20 с,
+    # и перезапуск в это время только мешает.
+    for _ in range(30):
+        if browser_windows():
+            return True
+        time.sleep(1)
+    for attempt in (1, 2, 3):
+        if browser_windows():
+            return True
+        idle_log("окна браузера нет — перезапускаю (попытка %d)" % attempt)
+        as_user("systemctl", "--user", "stop", "stb-browser")
+        subprocess.run(["pkill", "-x", "firefox-esr"], capture_output=True)
+        for _ in range(20):
+            time.sleep(0.5)
+            alive = subprocess.run(["pgrep", "-x", "firefox-esr"],
+                                   capture_output=True).stdout.strip()
+            if not alive:
+                break
+        profile = os.path.join(STB_HOME, ".mozilla", "stb")
+        for name in ("lock", ".parentlock"):
+            try:
+                os.remove(os.path.join(profile, name))
+            except OSError:
+                pass
+        as_user("systemctl", "--user", "reset-failed", "stb-browser")
+        as_user("systemctl", "--user", "start", "stb-browser")
+        for _ in range(20):
+            time.sleep(1)
+            if browser_windows():
+                return True
+    idle_log("окно браузера так и не появилось")
+    return False
+
+
+def cmd_idle(argv):
+    """Телевизор выключен — лишние программы не нужны: stb idle on|off."""
+    what = argv[0] if argv else ""
+    if what not in ("on", "off"):
+        print("usage: stb idle on|off", file=sys.stderr)
+        return 2
+    def say_idle(msg):
+        idle_log(msg)
+
+    def governor(name):
+        import glob
+        for path in glob.glob("/sys/devices/system/cpu/cpu*/cpufreq/scaling_governor"):
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(name)
+            except OSError:
+                pass
+
+    if what == "on":
+        say_idle("ТВ включён → поднимаю интерфейс")
+        governor("schedutil")
+        cmd_screen(["on"])
+        for unit in ("pipewire.socket", "pipewire-pulse.socket", "wireplumber"):
+            as_user("systemctl", "--user", "start", unit)
+        if not show_browser():
+            # окна нет совсем (первый запуск, падение) — поднимаем службу
+            as_user("systemctl", "--user", "reset-failed", "stb-browser")
+            as_user("systemctl", "--user", "start", "stb-browser")
+            if tv_alive() and not ensure_browser():
+                return 1
+    else:
+        say_idle("ТВ выключен → powersave сразу")
+        governor("powersave")
+        cmd_screen(["off"])
+        for unit in ("wireplumber", "pipewire-pulse.socket", "pipewire.socket"):
+            as_user("systemctl", "--user", "stop", unit)
+
+        # Браузер не трогаем: холодный старт Firefox на этом диске — 15–20 с,
+        # и всё это время на включённом телевизоре был бы чёрный экран.
+        # Закрываем только окно Jellyfin: оно занимает экран и звук.
+        say_idle("браузер оставляю в памяти — включение будет мгновенным")
+
+        subprocess.run(["flatpak", "kill", "org.jellyfin.JellyfinDesktop"], capture_output=True)
+        subprocess.run(["pkill", "-f", "jellyfin-desktop"], capture_output=True)
+
+    try:
+        with open("/run/stb/idle", "w", encoding="utf-8") as f:
+            f.write(what + "\n")
+    except OSError:
+        pass
+    return 0
+
+
+# ═══════════════════════════════════════════════════════════ заставка: флаг
+def cmd_screen(argv):
+    """Заставка: stb screen on|off|status."""
+    what = argv[0] if argv else "status"
+    minutes = stbconf.get("SCREENSAVER_MINUTES", "5")
+    if what == "on":
+        try:
+            with open(SCREEN_FLAG, "w", encoding="utf-8") as f:
+                f.write("on\n")
+        except OSError:
+            pass
+        as_user("systemctl", "--user", "start", "stb-screensaver")
+        print("заставка включена: %s мин" % minutes)
+        return 0
+    if what == "off":
+        try:
+            with open(SCREEN_FLAG, "w", encoding="utf-8") as f:
+                f.write("off\n")
+        except OSError:
+            pass
+        for marker in ("/run/stb/screenblank",
+                       os.path.join(user_env()["XDG_RUNTIME_DIR"], "stb-screenblank")):
+            try:
+                os.remove(marker)
+            except OSError:
+                pass
+        print("заставка выключена")
+        return 0
+    if what == "status":
+        try:
+            state = open(SCREEN_FLAG, encoding="utf-8").read().strip() or "off"
+        except OSError:
+            state = "off"
+        idle = as_user("xprintidle").stdout.strip() or "?"
+        blank = as_user("xdotool", "search", "--name", "Заставка").returncode == 0
+        print("состояние: %s" % state)
+        print("порог: %s мин" % minutes)
+        print("простой: %s мс" % idle)
+        print("чёрная вкладка: %s" % ("открыта" if blank else "нет"))
+        return 0
+    print("usage: stb screen on|off|status", file=sys.stderr)
+    return 2
+
+
+# ═══════════════════════════════════════════════════════════ браузер
+def cmd_browser(argv):
+    """Запустить Firefox окном на весь экран (служба stb-browser)."""
+    env = user_env()
+    proc = subprocess.Popen(["/usr/bin/firefox-esr", "--no-remote",
+                             "--profile", os.path.join(STB_HOME, ".mozilla/stb"),
+                             "http://127.0.0.1:%s/" % stbconf.get("STB_WEB_PORT", "8090")],
+                            env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    for _ in range(40):
+        time.sleep(0.5)
+        listing = subprocess.run(["wmctrl", "-l"], env=env, capture_output=True, text=True).stdout
+        for line in listing.splitlines():
+            if "Mozilla Firefox" in line:
+                wid = line.split()[0]
+                subprocess.run(["wmctrl", "-i", "-r", wid, "-b", "add,maximized_vert,maximized_horz"],
+                               env=env, capture_output=True)
+                subprocess.run(["wmctrl", "-i", "-a", wid], env=env, capture_output=True)
+                return proc.wait()
+    return proc.wait()
+
+
+# ═══════════════════════════════════════════════════════════ сессия
+def cmd_session(argv):
+    """Сессия приставки: openbox, панель уведомлений, привязки, браузер."""
+    log_path = "/var/log/stb/session.log"
+    env = user_env()
+
+    def log(msg):
+        try:
+            with open(log_path, "a", encoding="utf-8") as f:
+                f.write("%s %s\n" % (time.strftime("%F %T"), msg))
+        except OSError:
+            pass
+
+    log("сессия: старт")
+    out = subprocess.run(["xrandr"], env=env, capture_output=True, text=True).stdout
+    for line in out.splitlines():
+        if " connected" in line:
+            subprocess.run(["xrandr", "--output", line.split()[0], "--mode", "1920x1080"],
+                           env=env, capture_output=True)
+            break
+    subprocess.run(["xset", "-dpms", "s", "off"], env=env, capture_output=True)
+    subprocess.run(["xset", "s", "off"], env=env, capture_output=True)
+
+    for extra in ("xfce4-panel", "xfdesktop", "xfwm4", "dunst", "xbindkeys"):
+        subprocess.run(["pkill", "-x", extra], capture_output=True)
+
+    try:
+        layout = open("/var/lib/stb/lang", encoding="utf-8").read().strip() or "en"
+    except OSError:
+        layout = "en"
+    subprocess.run([sys.argv[0], "lang", layout], env=env, capture_output=True)
+
+    subprocess.Popen(["dunst"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, encoding="utf-8")
+    try:
+        openbox_log = open("/var/log/stb/openbox.log", "a", encoding="utf-8")
+    except OSError:
+        openbox_log = subprocess.DEVNULL      # журнала нет — сессия всё равно нужна
+    subprocess.Popen(["openbox", "--sm-disable"], env=env,
+                     stdout=openbox_log, stderr=openbox_log)
+    time.sleep(1)
+
+    subprocess.Popen(["xbindkeys", "-n"], env=env,
+                     stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, encoding="utf-8")
+    time.sleep(1)
+
+    # веб-страница: если служба не отвечает — поднимаем сами
+    import urllib.request
+    try:
+        urllib.request.urlopen("http://127.0.0.1:%s/api/buttons" %
+                               stbconf.get("STB_WEB_PORT", "8090"), timeout=2)
+    except Exception:  # noqa: BLE001
+        subprocess.Popen(["/usr/bin/python3", "/opt/stb/web/stb-web.py"], env=env,
+                         stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, encoding="utf-8")
+
+    cmd_mode(["nuc"])
+    if as_user("systemctl", "--user", "start", "stb-browser").returncode != 0:
+        log("user-служба недоступна — запускаю браузер напрямую")
+        while True:
+            subprocess.run(["/usr/bin/firefox-esr", "--kiosk", "--no-remote", "--profile",
+                            os.path.join(STB_HOME, ".mozilla/stb"),
+                            "http://127.0.0.1:%s/" % stbconf.get("STB_WEB_PORT", "8090")], env=env)
+            time.sleep(2)
+
+    while True:
+        time.sleep(30)
+
+
+# ═══════════════════════════════════════════════════════════ сеть и плеер
+def cmd_nic_watch(argv):
+    """Проверить новые зависания сетевого чипа и, если есть, сбросить линк."""
+    state = "/run/stb/nic_hangs"
+    dmesg = subprocess.run(["dmesg"], capture_output=True, text=True).stdout
+    now = dmesg.count("Hardware Unit Hang")
+    try:
+        last = int(open(state, encoding="utf-8").read().strip() or 0)
+    except (OSError, ValueError):
+        last = 0
+    try:
+        with open(state, "w", encoding="utf-8") as f:
+            f.write(str(now))
+    except OSError:
+        pass
+    if now > last and last != 0:
+        import syslog
+        syslog.syslog("новые зависания NIC: %d → %d, сбрасываю линк" % (last, now))
+        subprocess.run(["ip", "link", "set", TV_IF, "down"], capture_output=True)
+        time.sleep(3)
+        subprocess.run(["ip", "link", "set", TV_IF, "up"], capture_output=True)
+        time.sleep(4)
+        link = subprocess.run(["ethtool", TV_IF], capture_output=True, text=True).stdout
+        state_line = [row for row in link.splitlines() if "Link detected" in row]
+        syslog.syslog("линк поднят: %s" % (state_line[0].split()[-1] if state_line else "?"))
+    return 0
+
+
+JELLY_APP = "org.jellyfin.JellyfinDesktop"
+
+
+def jelly_windows(env):
+    """Окна плеера, которые реально видны (wmctrl перечисляет только показанные)."""
+    listing = subprocess.run(["wmctrl", "-l", "-x"], env=env,
+                             capture_output=True, text=True).stdout
+    return [line for line in listing.splitlines() if "jellyfin-desktop" in line.lower()]
+
+
+def jelly_running():
+    """Есть ли процессы плеера (по полной командной строке)."""
+    out = subprocess.run(["pgrep", "-f", "jellyfin-desktop"],
+                         capture_output=True, text=True).stdout
+    return [pid for pid in out.split() if pid]
+
+
+def jelly_kill(env, why=""):
+    """Погасить плеер целиком: flatpak, потом процессы, потом SIGKILL."""
+    if jelly_running():
+        say("плеер: гашу %s" % (why or "висящий экземпляр"))
+    subprocess.run(["flatpak", "kill", JELLY_APP], env=env, capture_output=True)
+    for _ in range(10):
+        if not jelly_running():
+            return True
+        subprocess.run(["pkill", "-f", "jellyfin-desktop"], capture_output=True)
+        time.sleep(0.5)
+    for _ in range(6):
+        if not jelly_running():
+            return True
+        subprocess.run(["pkill", "-9", "-f", "jellyfin-desktop"], capture_output=True)
+        time.sleep(0.5)
+    return not jelly_running()
+
+
+def cmd_player(argv):
+    """Jellyfin Desktop на приставке: показать окно или честно сказать, что не вышло."""
+    env = user_env()
+    # Плееру нужна сессионная шина: без неё он запускается и молча висит без окна.
+    bus = "/run/user/%s/bus" % subprocess.run(["id", "-u", STB_USER], capture_output=True,
+                                              text=True).stdout.strip()
+    if os.path.exists(bus) and not env.get("DBUS_SESSION_BUS_ADDRESS"):
+        env["DBUS_SESSION_BUS_ADDRESS"] = "unix:path=" + bus
+
+    if "--kill" in argv:
+        jelly_kill(env, "по команде")
+        return 0
+
+    if "--status" in argv:
+        print("окно: %s" % ("есть" if jelly_windows(env) else "нет"))
+        print("процессы: %s" % (", ".join(jelly_running()) or "нет"))
+        return 0
+
+    def fullscreen(wid):
+        if not wid:
+            return
+        geo = subprocess.run(["xdotool", "getdisplaygeometry"], env=env,
+                             capture_output=True, text=True).stdout.split()
+        subprocess.run(["wmctrl", "-i", "-r", wid, "-b", "remove,hidden"], env=env)
+        subprocess.run(["wmctrl", "-i", "-a", wid], env=env)
+        if len(geo) == 2:
+            subprocess.run(["wmctrl", "-i", "-r", wid, "-e", "0,0,0,%s,%s" % (geo[0], geo[1])],
+                           env=env)
+        subprocess.run(["wmctrl", "-i", "-r", wid, "-b", "add,fullscreen"], env=env)
+
+    windows = jelly_windows(env)
+    if windows:
+        fullscreen(windows[0].split()[0])
+        print("Jellyfin уже открыт")
+        return 0
+
+    # Процессы есть, окна нет — это и есть «висит ненужным»: гасим и запускаем заново.
+    if jelly_running():
+        jelly_kill(env, "висящий экземпляр без окна")
+        time.sleep(1)
+
+    try:
+        player_log = open("/var/log/stb/jellyfin.log", "w", encoding="utf-8")
+    except OSError:
+        player_log = subprocess.DEVNULL
+    subprocess.Popen(["flatpak", "run", JELLY_APP, "--tv", "--fullscreen"], env=env,
+                     stdout=player_log, stderr=subprocess.STDOUT, start_new_session=True)
+
+    for _ in range(30):
+        time.sleep(1)
+        windows = jelly_windows(env)
+        if windows:
+            time.sleep(1)
+            fullscreen(windows[0].split()[0])
+            print("Jellyfin открыт")
+            return 0
+
+    # Окно не появилось — процесс бесполезен, убираем, чтобы не висел в фоне.
+    jelly_kill(env, "окно не появилось за 30 с")
+    print("Jellyfin не показал окно — процесс выключен, смотри /var/log/stb/jellyfin.log",
+          file=sys.stderr)
+    return 1
+
+
+# ═══════════════════════════════════════════════════════════ сторож заставки
+def tv_shows_own_app():
+    """Телевизор показывает своё приложение, а не вход приставки.
+
+    Тогда заставка и гашение по простою запрещены: человек смотрит телевизор,
+    просто нажатий в нашу коробку не приходит. Именно из-за этого телевизор
+    однажды выключился посреди фильма.
+    """
+    if not TV_INPUT:
+        return False
+    try:
+        app = (daemon().state() or {}).get("app") or ""
+    except Exception:  # noqa: BLE001
+        app = ""
+    if not app:
+        # состояние приложения неизвестно (демон молчит) — лучше не гасить:
+        # выключить телевизор посреди фильма хуже, чем не включить заставку
+        return True
+    return app.lower() != ours
+
+
+def cmd_poweroff(argv):
+    """Выключить приставку: первое нажатие взводит, второе в течение 10 с — выключает."""
+    arm = "/run/stb/poweroff-armed"
+    if "--now" in argv:
+        print("выключаю приставку")
+        return subprocess.run(["sudo", "-n", "systemctl", "poweroff"]).returncode
+
+    try:
+        if os.path.exists(arm) and time.time() - os.path.getmtime(arm) <= 10:
+            os.remove(arm)
+            print("выключаю приставку")
+            return subprocess.run(["sudo", "-n", "systemctl", "poweroff"]).returncode
+    except OSError:
+        pass
+
+    try:
+        with open(arm, "w", encoding="utf-8") as f:
+            f.write(str(time.time()))
+    except OSError:
+        print("не смог поставить отметку в /run/stb", file=sys.stderr)
+        return 1
+    print("нажми ещё раз в течение 10 секунд, чтобы выключить приставку")
+    print("телевизор при этом остаётся включённым")
+    return 0
+
+
+def cmd_screensaver(argv):
+    """Сторож простоя: чёрная вкладка, затем гашение телевизора."""
+    import fcntl
+
+    minutes = int(stbconf.get("SCREENSAVER_MINUTES", "5") or 5)
+    limit_ms = minutes * 60 * 1000
+    if limit_ms <= 0:
+        return 0
+    sleep_after = int(stbconf.get("STB_TV_SLEEP_AFTER", "10") or 0) * 60
+    port = stbconf.get("STB_WEB_PORT", "8090")
+    runtime = user_env()["XDG_RUNTIME_DIR"]
+    opened_at = os.path.join(runtime, "stb-screenblank")
+    slept_marker = os.path.join(runtime, "stb-tv-slept")
+
+    lock_path = os.path.join(runtime, "stb-screensaver.lock")
+    lock = open(lock_path, "w", encoding="utf-8")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except OSError:
+        print("сторож уже работает — выхожу")
+        return 0
+
+    def log(msg):
+        print("%s %s" % (time.strftime("%F %T"), msg), flush=True)
+
+    def splash():
+        return as_user("xdotool", "search", "--name", "Заставка").returncode == 0
+
+    def fullscreen():
+        geo = as_user("xdotool", "getactivewindow", "getwindowgeometry", "--shell").stdout
+        width = ""
+        for line in geo.splitlines():
+            if line.startswith("WIDTH="):
+                width = line.split("=", 1)[1]
+        disp = as_user("xdotool", "getdisplaygeometry").stdout.split()
+        return bool(width) and bool(disp) and width == disp[0]
+
+    def close_splash():
+        if not splash():
+            return
+        as_user("xdotool", "key", "--clearmodifiers", "F11")
+        time.sleep(0.4)
+        as_user("xdotool", "key", "--clearmodifiers", "ctrl+w")
+        time.sleep(0.6)
+        if splash():
+            as_user("wmctrl", "-c", "Заставка")
+            time.sleep(0.3)
+        for marker in (opened_at, slept_marker):
+            try:
+                os.remove(marker)
+            except OSError:
+                pass
+
+    def go(url):
+        as_user("xdotool", "key", "--clearmodifiers", "ctrl+l")
+        time.sleep(0.2)
+        as_user("xdotool", "type", "--delay", "40", url)
+        time.sleep(0.5)
+        as_user("xdotool", "key", "--clearmodifiers", "Return")
+        time.sleep(1.5)
+
+    def open_splash():
+        if splash():
+            open(opened_at, "w", encoding="utf-8").close()
+            return
+        url = "http://127.0.0.1:%s/black" % port
+        as_user("xdotool", "key", "--clearmodifiers", "ctrl+t")
+        time.sleep(0.25)
+        as_user("xdotool", "key", "--clearmodifiers", "F11")
+        time.sleep(0.6)
+        go(url)
+        if not fullscreen():
+            as_user("xdotool", "key", "--clearmodifiers", "F11")
+            time.sleep(0.4)
+        if not splash():
+            go(url)
+            as_user("xdotool", "key", "--clearmodifiers", "F11")
+            time.sleep(0.4)
+        open(opened_at, "w", encoding="utf-8").close()
+
+    try:
+        os.remove(slept_marker)
+    except OSError:
+        pass
+
+    log("сторож заставки: порог %d мин" % minutes)
+    tick = 0
+    while True:
+        try:
+            state = open(SCREEN_FLAG, encoding="utf-8").read().strip() or "on"
+        except OSError:
+            state = "on"
+        if state != "on" or mode_get() != "nuc" or tv_shows_own_app():
+            close_splash()
+            time.sleep(5)
+            continue
+
+        idle_out = as_user("xprintidle").stdout.strip()
+        idle = int(idle_out) if idle_out.isdigit() else 0
+
+        if splash():
+            age = 0
+            if os.path.exists(opened_at):
+                age = max(0, int(time.time() - os.path.getmtime(opened_at)))
+            else:
+                open(opened_at, "w", encoding="utf-8").close()
+
+            if age >= 10 and idle < 3000:
+                close_splash()
+
+            if (sleep_after > 0 and age >= sleep_after and not os.path.exists(slept_marker)
+                    and splash() and mode_get() == "nuc" and state == "on"):
+                if daemon().power() == "Active":
+                    if cmd_tv(["off"]) == 0:
+                        open(slept_marker, "w", encoding="utf-8").close()
+                        log("заставка %d с — гашу телевизор (тишина %d мин)"
+                            % (age, sleep_after // 60))
+                else:
+                    open(slept_marker, "w", encoding="utf-8").close()
+            time.sleep(2)
+            continue
+
+        if idle >= limit_ms:
+            open_splash()
+            time.sleep(2)
+            continue
+
+        tick += 1
+        if tick >= 15:
+            tick = 0
+            if "DPMS is Enabled" in as_user("xset", "q").stdout:
+                as_user("xset", "-dpms")
+                as_user("xset", "dpms", "0", "0", "0")
+            as_user("xset", "s", "off")
+
+        time.sleep(10 if idle < limit_ms - 90000 else 2)
+
+
+COMMANDS = {
+    "tv": cmd_tv,
+    "mode": cmd_mode,
+    "toggle": cmd_toggle,
+    "box": cmd_box,
+    "jelly": cmd_jelly,
+    "live": cmd_live,
+    "close": cmd_close,
+    "lang": cmd_lang,
+    "ctl": cmd_ctl,
+    "boot": cmd_boot,
+    "preflight": cmd_preflight,
+    "zoom": cmd_zoom,
+    "key": cmd_key,
+    "help": cmd_help,
+    "pair": cmd_pair,
+    "keys": cmd_keys,
+    "idle": cmd_idle,
+    "screen": cmd_screen,
+    "browser": cmd_browser,
+    "session": cmd_session,
+    "nic-watch": cmd_nic_watch,
+    "player": cmd_player,
+    "screensaver": cmd_screensaver,
+    "poweroff": cmd_poweroff,
+}
+
+
+def main(argv):
+    name = os.path.basename(argv[0])
+    args = argv[1:]
+
+    # вызов как `tv` — это сокращение для `stb tv`
+    if name == "tv":
+        return cmd_tv(args) if args else cmd_tv(["status"])
+
+    if not args:
+        print(help_text())
+        return 2
+    if args[0] in ("-h", "--help", "help"):
+        return cmd_help(args[1:])
+
+    if len(args) > 1 and args[1] in ("-h", "--help"):
+        return cmd_help([args[0]])
+
+    cmd = COMMANDS.get(args[0])
+    if not cmd:
+        print("неизвестная команда: %s" % args[0], file=sys.stderr)
+        print("команды: %s" % ", ".join(COMMANDS), file=sys.stderr)
+        return 2
+    return cmd(args[1:])
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

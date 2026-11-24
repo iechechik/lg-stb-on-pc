@@ -1,0 +1,65 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Поиск</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; min-height: 100vh; display: flex; flex-direction: column;
+         align-items: center; justify-content: center; gap: 34px;
+         font-family: system-ui, "DejaVu Sans", sans-serif;
+         background: radial-gradient(circle at 30% 15%, #1b2740, #090c12 70%); color: #eef4ff; }
+  h1 { font-size: 40px; font-weight: 600; margin: 0; color: #9fb3d1; }
+  form { width: min(1200px, 92vw); display: flex; gap: 16px; }
+  input[type=text] {
+    flex: 1; font-size: 40px; padding: 18px 24px; border-radius: 16px;
+    border: 2px solid rgba(255,255,255,.18); background: rgba(255,255,255,.08);
+    color: #fff; outline: none;
+  }
+  input[type=text]:focus { border-color: #6f9dff; background: rgba(120,170,255,.14); }
+  button {
+    font-size: 34px; padding: 18px 34px; border-radius: 16px; cursor: pointer;
+    border: 1px solid rgba(255,255,255,.2); background: rgba(120,170,255,.22); color: #eef4ff;
+  }
+  button:hover { background: rgba(120,170,255,.38); }
+  .links { display: flex; gap: 14px; flex-wrap: wrap; justify-content: center; }
+  .links a { font-size: 24px; color: #9db2cf; text-decoration: none;
+             padding: 12px 20px; border-radius: 12px; background: rgba(255,255,255,.06); }
+  .links a:hover { background: rgba(120,170,255,.22); color: #fff; }
+  .hint { font-size: 20px; color: #7f94b0; }
+  #lang { display: flex; gap: 12px; align-items: center; }
+  #lang button { font-size: 28px; padding: 12px 26px; }
+  #lang button.on { background: rgba(120,255,170,.30); border-color: rgba(120,255,170,.6); }
+  #lang span { font-size: 22px; color: #7f94b0; }
+</style>
+</head>
+<body>
+<h1>Поиск</h1>
+<!-- Результаты открываются в новой вкладке: страница поиска остаётся, можно искать снова. -->
+<form action="https://www.google.com/search" method="get" target="_blank">
+  <input type="text" name="q" placeholder="что найти?" autofocus>
+  <button type="submit">Найти</button>
+</form>
+<div class="links">
+  <a href="https://www.youtube.com">YouTube</a>
+  <a href="https://ru.wikipedia.org">Википедия</a>
+  <a href="https://yandex.ru">Яндекс</a>
+  <a href="/">← на приставку</a>
+</div>
+<div id="lang">
+  <span>раскладка:</span>
+  <button data-l="ru">РУС</button>
+  <button data-l="en">ENG</button>
+</div>
+<div class="hint">Enter — искать, Back — вернуться на сетку. Кнопки РУС/ENG переключают раскладку клавиатуры приставки.</div>
+<script>
+  const btns = document.querySelectorAll('#lang button');
+  function mark(l) { btns.forEach(b => b.classList.toggle('on', b.dataset.l === l)); }
+  btns.forEach(b => b.addEventListener('click', () => {
+    fetch('/lang/' + b.dataset.l).then(r => r.json()).then(j => { if (j.ok) mark(b.dataset.l); });
+  }));
+  fetch('/lang/status').then(r => r.json()).then(j => mark(j.layout))
+    .catch(() => {});
+</script>
+</body>
+</html>

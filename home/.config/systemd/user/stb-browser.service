@@ -1,0 +1,20 @@
+[Unit]
+Description=STB: браузер с сеткой (окно с вкладками)
+After=stb-web.service
+Wants=stb-web.service
+
+[Service]
+Type=simple
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/home/stbuser/.Xauthority
+Environment=XCURSOR_THEME=Adwaita
+Environment=XCURSOR_SIZE=64
+WorkingDirectory=/home/stbuser
+ExecStart=/opt/stb/bin/stb browser
+ExecStartPre=-/bin/sh -c 'rm -f /home/stbuser/.mozilla/stb/lock /home/stbuser/.mozilla/stb/.parentlock'
+ExecStartPre=-/bin/sh -c 'sz=$(du -sm /home/stbuser/.mozilla/stb/cache2 2>/dev/null | cut -f1); [ -n "$sz" ] && [ "$sz" -gt 400 ] && rm -rf /home/stbuser/.mozilla/stb/cache2; exit 0'
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

@@ -1,0 +1,321 @@
+#!/usr/bin/env python3
+"""stb-tv-link — одно постоянное соединение с телевизором на всю приставку.
+
+Зачем: раньше каждая кнопка и каждая проверка поднимали отдельный процесс
+Python с WebSocket-рукопожатием (0.5–1.5 с на нажатие, постоянная нагрузка).
+Теперь соединение одно, а все желающие — пульт по Wi-Fi, Bluetooth-пульт,
+сторож телевизора, сторож звука, утилита tv — спрашивают демон через сокет.
+
+Протокол: строка JSON на запрос, строка JSON в ответ.
+    {"cmd":"state"}                       состояние питания/звука/приложения
+    {"cmd":"key","name":"UP"}             кнопка (UP, DOWN, LEFT, RIGHT, ENTER, BACK, HOME, ...)
+    {"cmd":"vol","dir":"up"|"down"}       громкость
+    {"cmd":"mute","on":true|false}        без звука
+    {"cmd":"input","id":"HDMI_3"}         вход
+    {"cmd":"app","id":"org.jellyfin.webos"} приложение
+    {"cmd":"speaker","id":"external_arc"} выход звука
+    {"cmd":"speakers"}                    список выходов звука
+    {"cmd":"power","on":false}            выключить телевизор
+    {"cmd":"apps"}                        список приложений
+"""
+import asyncio
+import glob
+import json
+import os
+import sys
+import time
+
+sys.path.insert(0, "/opt/stb/lib")
+import stbconf  # noqa: E402
+
+STB_HOME = stbconf.get("STB_HOME", "/home/stbuser")
+for _p in glob.glob(os.path.join(STB_HOME, "tvctl", "lib", "python3*", "site-packages")):
+    sys.path.insert(0, _p)
+
+import bscpylgtv  # noqa: E402
+
+TV = stbconf.get("TV_IP", "")
+KEY = os.path.join(STB_HOME, ".aiopylgtv.sqlite")
+MANIFEST = os.path.join(STB_HOME, "tvctl/nuc_manifest.json")
+SOCK = stbconf.get("STB_TV_SOCK", "/run/stb/tv.sock")
+LOG = "/var/log/stb/tvdaemon.log"
+
+STATE = {"power": None, "sound": None, "app": None, "volume": None,
+         "muted": None, "updated": None}   # updated — когда телевизор подтвердил состояние
+_client = None
+_lock = asyncio.Lock()
+
+
+def log(msg):
+    line = "%s %s\n" % (time.strftime("%F %T"), msg)
+    try:
+        with open(LOG, "a", encoding="utf-8") as f:
+            f.write(line)
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------- события от ТВ
+async def on_power(payload):
+    STATE["power"] = (payload or {}).get("state")
+
+
+async def on_sound(payload):
+    STATE["sound"] = (payload or {}).get("soundOutput")
+
+
+async def on_app(payload):
+    STATE["app"] = (payload or {}).get("appId")
+
+
+async def on_volume(payload):
+    payload = payload or {}
+    STATE["volume"] = payload.get("volume")
+    STATE["muted"] = payload.get("muted")
+
+
+async def connect():
+    """Новое соединение + подписки. Вызывается только под замком."""
+    global _client  # pylint: disable=global-statement
+    client = await bscpylgtv.WebOsClient.create(
+        TV, key_file_path=KEY, manifest_file_path=MANIFEST, states=[])
+    await client.connect()
+    # Подписки на этой модели не работают (каждый вызов падал и оставлял
+    # полуоткрытый сокет), а у LG число подключений ограничено — приставка
+    # вытесняла Home Assistant. Состояние берём опросом: сторож спрашивает
+    # его каждые 4 секунды, этого достаточно.
+    _client = client
+    log("соединение с телевизором установлено")
+    return client
+
+
+async def drop():
+    global _client  # pylint: disable=global-statement
+    if _client is not None:
+        try:
+            await _client.close()
+        except Exception:  # noqa: BLE001
+            pass
+        _client = None
+
+
+async def ensure():
+    if _client is None:
+        try:
+            return await connect()
+        except Exception as exc:  # noqa: BLE001
+            # Частая причина — телевизор ждёт подтверждения привязки:
+            # на экране запрос «подключиться?», а соединение рвётся.
+            log("соединение не поднялось (%s); если на телевизоре запрос "
+                "подключения — подтверди его" % str(exc)[:80])
+            raise
+    return _client
+
+
+# ---------------------------------------------------------------- команды
+COMMAND_TIMEOUT = 10.0   # секунд на одну команду целиком
+CONNECT_TIMEOUT = 8.0    # секунд на установление соединения
+
+
+def touch():
+    """Отметка: в этот момент телевизор подтвердил состояние."""
+    STATE["updated"] = time.time()
+
+
+async def cmd_state(client):
+    """Состояние питания, звука и приложения — параллельно, с ограничением.
+
+    Последовательные запросы к телевизору складывались в секунды, поэтому
+    три независимых вопроса задаются одновременно.
+    """
+
+    async def safe(coro):
+        try:
+            return await asyncio.wait_for(coro, timeout=2)
+        except Exception:  # noqa: BLE001
+            return None
+
+    power, sound, app = await asyncio.gather(
+        safe(client.get_power_state()),
+        safe(client.get_sound_output()),
+        safe(client.get_current_app()),
+    )
+    fresh = False
+    if isinstance(power, dict) and power.get("state"):
+        STATE["power"] = power["state"]
+        fresh = True
+    if isinstance(sound, str) and sound:
+        STATE["sound"] = sound
+        fresh = True
+    if isinstance(app, str) and app:
+        if STATE["app"] != app:
+            # по этой строке видно, что человек смотрит: Jellyfin телевизора,
+            # эфир, браузер — всё, что не наш вход
+            log("на экране телевизора: %s" % app)
+        STATE["app"] = app
+        fresh = True
+    if not fresh:
+        # Ни один вопрос не получил ответа — соединение мертво, даже если
+        # клиент считает себя подключённым. Молча отдавать старое состояние
+        # нельзя: сторож по нему гасил экран и не поднимал обратно.
+        raise ConnectionError("телевизор не ответил ни на один вопрос")
+    touch()
+    return {"ok": True, "state": dict(STATE)}
+
+
+def as_bool(raw, default=False):
+    """`on`, `off`, true/false, 1/0 — всё, что может прийти от CLI и из тестов."""
+    if raw is None:
+        return default
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() in ("on", "true", "1", "yes", "mute")
+
+
+async def dispatch(client, cmd, req):
+    """Одна команда. Контракт описан в docs/SYSTEM.md, раздел «Протокол stb-tv-link»."""
+    if cmd == "state":
+        return await cmd_state(client)
+    if cmd == "key":
+        await client.button(str(req["name"]).upper())
+        return {"ok": True}
+    if cmd == "vol":
+        if req.get("level") is not None:
+            level = max(0, min(100, int(req["level"])))
+            await client.set_volume(level)
+            STATE["volume"] = level
+        elif str(req.get("dir", "")).lower() == "down":
+            await client.volume_down()
+        else:
+            await client.volume_up()
+        touch()
+        return {"ok": True}
+    if cmd == "mute":
+        on = as_bool(req.get("on", req.get("state")))
+        await client.set_mute(on)
+        STATE["muted"] = on
+        touch()
+        return {"ok": True}
+    if cmd == "input":
+        await client.set_input(str(req["id"]))
+        STATE["app"] = None
+        touch()
+        return {"ok": True}
+    if cmd == "app":
+        await client.launch_app(str(req["id"]))
+        STATE["app"] = None
+        touch()
+        return {"ok": True}
+    if cmd == "speaker":
+        await client.change_sound_output(str(req["id"]))
+        STATE["sound"] = str(req["id"])
+        touch()
+        return {"ok": True}
+    if cmd == "speakers":
+        return {"ok": True, "speakers": await client.get_sound_output()}
+    if cmd == "power":
+        want_on = req.get("on")
+        if want_on is None:
+            want_on = str(req.get("state", "")).lower() in ("on", "active")
+        if want_on:
+            return {"ok": False, "msg": "включение — через WoL, не по SSAP"}
+        await client.power_off()
+        STATE["power"] = "Screen Off"
+        touch()
+        return {"ok": True}
+    if cmd == "move":
+        await client.move(int(req.get("dx", 0)), int(req.get("dy", 0)))
+        return {"ok": True}
+    if cmd == "click":
+        await client.click()
+        return {"ok": True}
+    if cmd == "scroll":
+        await client.scroll(0, int(req.get("dy", 0)))
+        return {"ok": True}
+    if cmd == "apps":
+        return {"ok": True, "apps": await client.get_apps_all()}
+    return {"ok": False, "msg": "неизвестная команда: %s" % cmd}
+
+
+async def handle(req):
+    """Команда целиком под таймаутом: зависший запрос не держит очередь вечно."""
+    cmd = (req or {}).get("cmd", "")
+    try:
+        await asyncio.wait_for(_lock.acquire(), timeout=COMMAND_TIMEOUT)
+    except asyncio.TimeoutError:
+        log("команда %s ждала очередь дольше %.0f с" % (cmd, COMMAND_TIMEOUT))
+        return {"ok": False, "msg": "демон занят другой командой"}
+    try:
+        try:
+            client = await asyncio.wait_for(ensure(), timeout=CONNECT_TIMEOUT)
+        except Exception as exc:  # noqa: BLE001
+            log("соединение не установлено (%s)" % str(exc)[:80])
+            return {"ok": False, "msg": "нет связи с телевизором"}
+        try:
+            return await asyncio.wait_for(dispatch(client, cmd, req),
+                                          timeout=COMMAND_TIMEOUT)
+        except asyncio.TimeoutError:
+            log("команда %s не ответила за %.0f с — переподключаюсь"
+                % (cmd, COMMAND_TIMEOUT))
+            await drop()
+            return {"ok": False, "msg": "телевизор не ответил"}
+        except Exception as exc:  # noqa: BLE001
+            log("команда %s не удалась (%s) — переподключаюсь" % (cmd, str(exc)[:80]))
+            await drop()
+            return {"ok": False, "msg": str(exc)[:200]}
+    finally:
+        _lock.release()
+
+
+async def serve_conn(reader, writer):
+    try:
+        line = await asyncio.wait_for(reader.readline(), timeout=30)
+        if not line:
+            return
+        try:
+            req = json.loads(line.decode("utf-8", "replace"))
+        except ValueError:
+            writer.write('{"ok":false,"msg":"нужен JSON"}\n'.encode("utf-8"))
+            await writer.drain()
+            return
+        resp = await handle(req)
+        writer.write((json.dumps(resp, ensure_ascii=False) + "\n").encode())
+        await writer.drain()
+    except Exception as exc:  # noqa: BLE001
+        log("соединение с телевизором прервалось: %s (переподключаюсь)" % str(exc)[:120])
+    finally:
+        try:
+            writer.close()
+            await writer.wait_closed()
+        except Exception:  # noqa: BLE001
+            pass
+
+
+async def periodic_state():
+    """Раз в минуту обновляем кэш состояния, пока ТВ включён."""
+    while True:
+        await asyncio.sleep(60)
+        try:
+            async with _lock:
+                if _client is not None and STATE.get("power") == "Active":
+                    STATE["sound"] = await _client.get_sound_output()
+        except Exception:  # noqa: BLE001
+            await drop()
+
+
+async def main():
+    if os.path.exists(SOCK):
+        os.unlink(SOCK)
+    server = await asyncio.start_unix_server(serve_conn, path=SOCK)
+    os.chmod(SOCK, 0o660)
+    log("демон запущен, сокет %s" % SOCK)
+    asyncio.create_task(periodic_state())
+    async with server:
+        await server.serve_forever()
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        pass

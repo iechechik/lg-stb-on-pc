@@ -1,0 +1,35 @@
+# Собрано из /opt/stb/config/buttons-bt.conf — правьте карту, а не этот файл.
+# Применить: stb keys apply bt
+
+"/opt/stb/bin/stb key power"
+    XF86PowerOff
+
+"/opt/stb/bin/stb key volup"
+    XF86AudioRaiseVolume
+
+"/opt/stb/bin/stb key voldown"
+    XF86AudioLowerVolume
+
+"/opt/stb/bin/stb key mute"
+    XF86AudioMute
+
+"/opt/stb/bin/stb key back"
+    XF86Back
+
+"/opt/stb/bin/stb key home"
+    XF86HomePage
+
+"/opt/stb/bin/stb key menu"
+    XF86MenuKB
+
+"/opt/stb/bin/stb key play"
+    XF86AudioPlay
+
+"/opt/stb/bin/stb key prev"
+    XF86AudioRewind
+
+"/opt/stb/bin/stb key next"
+    XF86AudioForward
+
+"/opt/stb/bin/stb key down"
+    XF86Search

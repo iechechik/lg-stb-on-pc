@@ -1,0 +1,14 @@
+[Unit]
+PartOf=stb.target
+Description=STB: сторожа (телевизор, звук, WoL, кнопка корпуса)
+After=network-online.target stb-tv-link.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 /opt/stb/bin/stb-watch all
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target

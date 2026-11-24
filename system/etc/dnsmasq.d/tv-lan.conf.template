@@ -1,0 +1,10 @@
+# DHCP для телевизора на интерфейсе приставки.
+# Подставлено установщиком: имя интерфейса, MAC и адрес телевизора, шлюз и DNS.
+# DNS-сервер сам не поднимаем (port=0) — только выдаём адрес.
+port=0
+interface=@TV_IF@
+bind-interfaces
+dhcp-range=@TV_IP@,@TV_IP@,255.255.255.0,12h
+dhcp-host=@TV_MAC@,@TV_IP@,lg-tv
+dhcp-option=3,@GW@
+dhcp-option=6,@DNS@

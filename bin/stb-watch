@@ -1,0 +1,945 @@
+#!/usr/bin/env python3
+"""stb-watch — сторожа приставки одной программой.
+
+    stb-watch all        запустить всех (так его поднимает systemd)
+    stb-watch tv         только телевизор: состояние, powersave, выключение
+    stb-watch audio      только звук: держит нужный выход
+    stb-watch wol        только WoL: повторяет пакеты в провод телевизора
+    stb-watch chassis    только кнопка на корпусе
+
+    stb-watch bt-agent   сопряжение Bluetooth-пульта (агент BlueZ)
+    stb-watch bt-log     журнал нажатий Bluetooth-пульта
+    stb-watch bt-keys    редкие клавиши пульта (раскладка, режим)
+    stb-watch bt-pointer тачпад пульта → курсор телевизора
+
+Разделы независимы: падение одного не мешает остальным, каждый пишет свой журнал,
+который знает по прежнему имени (/var/log/stb/tvwatch.log и т.д.).
+"""
+import json
+import os
+import select
+import selectors
+import socket
+import subprocess
+import sys
+import threading
+import time
+
+sys.path.insert(0, "/opt/stb/lib")
+import stbconf  # noqa: E402
+
+LOGS = {
+    "tv": "/var/log/stb/tvwatch.log",
+    "audio": "/var/log/stb/audio.log",
+    "wol": "/var/log/stb/wol.log",
+    "chassis": "/var/log/stb/system.log",
+    "bt-agent": "/var/log/stb/pair.log",
+    "bt-log": "/var/log/stb/buttons.log",
+    "bt-keys": "/var/log/stb/extrakeys.log",
+    "bt-pointer": "/var/log/stb/pointer.log",
+}
+RESTART_AFTER = 10.0
+
+
+def log(section, msg):
+    stamp = time.strftime("%F %T" if section != "wol" else "%H:%M:%S")
+    line = "%s %s\n" % (stamp, msg)
+    path = LOGS.get(section, "/var/log/stb/system.log")
+    try:
+        os.makedirs(os.path.dirname(path), exist_ok=True)
+        with open(path, "a", buffering=1, encoding="utf-8") as f:
+            f.write(line)
+    except OSError:
+        pass
+    sys.stdout.write(line)
+    sys.stdout.flush()
+
+
+# ═══════════════════════════════════════════════════════════ телевизор
+STB_HOME = stbconf.get("STB_HOME", "/home/stbuser")
+TV = stbconf.get("TV_IP", "")
+TV_INPUT = stbconf.get("TV_INPUT_ID", "")
+INPUT_ON_WAKE = str(stbconf.get("TV_INPUT_ON_WAKE", "0")).strip() in ("1", "yes", "true")
+CHECK_EVERY = 4
+NEED_CONFIRM = 2          # сколько одинаковых ответов подряд, чтобы поверить
+POWEROFF_AFTER = int(stbconf.get("IDLE_POWEROFF_AFTER", "0") or 0)
+DRY = str(stbconf.get("STB_POWEROFF_DRY", "0")).strip() in ("1", "yes", "true")
+IGNORE_SSH = str(stbconf.get("STB_POWEROFF_IGNORE_SSH", "0")).strip() in ("1", "yes", "true")
+SSH_IDLE_LIMIT = int(stbconf.get("SSH_IDLE_LIMIT", "900") or 900)
+DAEMON_SOCK = os.environ.get("STB_TV_SOCK", "/run/stb/tv.sock")
+
+_last_state = None
+_net_misses = 0
+_last_on = None
+
+
+def daemon_ask(req, timeout=5.0):
+    """Запрос к демону телевизора: одно соединение на всю приставку."""
+    try:
+        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        s.settimeout(timeout)
+        s.connect(DAEMON_SOCK)
+        s.sendall((json.dumps(req, ensure_ascii=False) + "\n").encode("utf-8"))
+        data = b""
+        while not data.endswith(b"\n"):
+            chunk = s.recv(65536)
+            if not chunk:
+                break
+            data += chunk
+        s.close()
+        return json.loads(data.decode("utf-8", "replace") or "{}")
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def power_state():
+    """(состояние, возраст сведений в секундах).
+
+    Порт 3000 у LG отвечает и при погашенном экране, поэтому «порт открыт»
+    не значит «телевизор включён». Пустое состояние — демон не ответил.
+    Возраст берётся из отметки, которую двигает только ответ телевизора:
+    если подписка молчит, сведения стареют, и по ним нельзя гасить экран.
+    """
+    answer = daemon_ask({"cmd": "state"})
+    state = answer.get("state") or {}
+    age = None
+    if state.get("updated"):
+        age = max(0.0, time.time() - float(state["updated"]))
+    if answer.get("stale"):
+        age = None            # ответ помечен как несвежий — считаем неизвестным
+    return (state.get("power") or ""), age
+
+
+def tv_in_network():
+    """Отвечает ли телевизор в сети (ping): включённый LG отвечает всегда."""
+    try:
+        return subprocess.run(["ping", "-c", "1", "-W", "1", TV],
+                              capture_output=True).returncode == 0
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def decide(state, age, online, last_on, misses):
+    """Что считать: включён ли телевизор.
+
+    Правила (по ним же построен тест tests/test_tv_cycle.py):
+    1. состояние известно и свежее — включён только при Active;
+    2. состояние неизвестно, но телевизор отвечает в сети — не трогаем экран
+       (иначе получится чёрный экран при живом телевизоре);
+    3. состояние неизвестно и телевизор из сети ушёл — это ждущий режим
+       (этот LG в standby сеть гасит). Гасим экран только со второго промаха,
+       чтобы случайный сбой связи не погасил картинку.
+    """
+    stale = age is None or age > STATE_MAX_AGE
+    if state and not stale:
+        return state == "Active"
+    if online:
+        return bool(last_on)
+    return False if misses >= 2 else bool(last_on)
+
+
+def tv_is_on():
+    """Состояние телевизора с учётом свежести и видимости в сети."""
+    global _last_state, _last_on, _net_misses  # pylint: disable=global-statement
+    # Сначала пинг (1 с). Если телевизор ушёл из сети, спрашивать SSAP
+    # бессмысленно: ожидание ответа демона — 6 с на каждый опрос.
+    online = tv_in_network()
+    if online:
+        state, age = power_state()
+    else:
+        state, age = "", None
+    if online:
+        _net_misses = 0
+    else:
+        _net_misses += 1
+
+    on = decide(state, age, online, _last_on, _net_misses)
+
+    if not state or age is None or age > STATE_MAX_AGE:
+        mark = "online" if online else "offline%d" % _net_misses
+        if _last_state != mark:
+            if online:
+                log("tv", "состояние телевизора неизвестно (в сети отвечает) — экран не трогаю")
+            elif _net_misses in (1, 2) or _net_misses % 10 == 0:
+                log("tv", "телевизор не в сети (проверка %d) → %s"
+                    % (_net_misses, "считаю выключенным" if _net_misses >= 2
+                       else "жду подтверждения"))
+            _last_state = mark
+    elif state != _last_state:
+        log("tv", "состояние телевизора: %s" % state)
+        _last_state = state
+    _last_on = on
+    return _last_on
+
+
+def idle_seconds(text):
+    """«0.50s», «12:34», «2days» → секунды. Непонятное считаем «свежим»."""
+    try:
+        if text.endswith("s") and ":" not in text:
+            return int(float(text[:-1]))
+        if text.endswith("m"):
+            return int(float(text[:-1]) * 60)
+        if "day" in text:
+            return 10 ** 9
+        if ":" in text:
+            minutes, seconds = text.split(":")
+            return int(minutes) * 60 + int(seconds)
+    except (ValueError, TypeError):
+        pass
+    return 0
+
+
+def ssh_session_active():
+    """Живая работа по ssh: залипшая сессия не должна запрещать выключение навсегда."""
+    if IGNORE_SSH:
+        return False
+    try:
+        out = subprocess.run(["/usr/bin/w", "-h"], capture_output=True,
+                             timeout=5).stdout.decode("utf-8", "replace")
+    except Exception:  # noqa: BLE001
+        return False
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) < 5:
+            continue
+        tty = parts[1]
+        if not tty.startswith(("pts/", "tty")):
+            continue
+        idle = idle_seconds(parts[4])
+        if idle <= SSH_IDLE_LIMIT:
+            log("tv", "ssh-сессия %s (%s) активна, простой %d с — приставку не гасим"
+                % (tty, parts[0], idle))
+            return True
+    return False
+
+
+def poweroff(reason):
+    if DRY:
+        log("tv", "ПРОБНО: выключил бы приставку (%s), но включён STB_POWEROFF_DRY" % reason)
+        return
+    log("tv", "выключаю приставку: %s" % reason)
+    subprocess.run(["/usr/bin/systemctl", "poweroff"], capture_output=True)
+
+
+def current_mode():
+    try:
+        with open("/run/stb/mode", encoding="utf-8") as f:
+            return f.read().strip() or "nuc"
+    except OSError:
+        return "nuc"
+
+
+def switch_to_stb_input():
+    """Телевизор включился — вывести на вход приставки."""
+    if not (INPUT_ON_WAKE and TV_INPUT) or current_mode() != "nuc":
+        return
+    try:
+        subprocess.run(["/opt/stb/bin/tv", "setinput", TV_INPUT], capture_output=True,
+                       timeout=20,
+                       env={"HOME": STB_HOME, "PATH": "/opt/stb/bin:/usr/local/bin:/usr/bin:/bin"})
+        log("tv", "вход переключён на %s" % TV_INPUT)
+    except Exception as exc:  # noqa: BLE001
+        log("tv", "не смог переключить вход: %r" % (exc,))
+
+
+STATE_MAX_AGE = float(os.environ.get("STB_TV_STATE_MAX_AGE")
+                       or stbconf.get("STB_TV_STATE_MAX_AGE", "90") or 90)
+
+
+def jelly_has_window():
+    """Есть ли видимое окно плеера (wmctrl перечисляет только показанные)."""
+    env = {"DISPLAY": ":0", "XAUTHORITY": os.path.join(STB_HOME, ".Xauthority"),
+           "HOME": STB_HOME}
+    try:
+        out = subprocess.run(["wmctrl", "-l", "-x"], env=env, capture_output=True,
+                             text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return True                      # не смогли проверить — не трогаем
+    return any("jellyfin-desktop" in line.lower() for line in out.splitlines())
+
+
+def jelly_processes():
+    try:
+        out = subprocess.run(["pgrep", "-f", "jellyfin-desktop"], capture_output=True,
+                             text=True, timeout=10).stdout
+    except (OSError, subprocess.SubprocessError):
+        return []
+    return [pid for pid in out.split() if pid]
+
+
+def jelly_cleanup(misses):
+    """Убрать плеер, который висит без окна.
+
+    `misses` — сколько проверок подряд окна не было; решение принимается на
+    второй, чтобы не убить плеер в момент запуска.
+    """
+    if not jelly_processes():
+        return 0
+    if jelly_has_window():
+        return 0
+    misses += 1
+    if misses < 2:
+        return misses
+    log("tv", "плеер висит без окна — выключаю (%d процессов)" % len(jelly_processes()))
+    subprocess.run(["flatpak", "kill", "org.jellyfin.JellyfinDesktop"], capture_output=True)
+    subprocess.run(["pkill", "-f", "jellyfin-desktop"], capture_output=True)
+    return 0
+
+
+def set_interface(state):
+    """Лёгкий режим — вспомогательное действие: его сбой не должен ронять сторож."""
+    try:
+        # Подъём интерфейса ждёт окно браузера до 30 с и может перезапускать
+        # его, поэтому 60 с могло не хватить: даём 180 с с запасом.
+        subprocess.run(["/opt/stb/bin/stb", "idle", state],
+                       capture_output=True, timeout=180, check=False)
+    except Exception as exc:  # noqa: BLE001
+        log("tv", "лёгкий режим не переключился (%r) — продолжаю" % (exc,))
+
+
+def watch_tv():
+    log("tv", "старт: следим за телевизором")
+    if POWEROFF_AFTER > 0:
+        log("tv", "простой: приставка выключится после %d с без телевизора" % POWEROFF_AFTER)
+
+    known = None
+    same = 0
+    off_since = None
+    warned = False
+    jelly_misses = 0
+    next_jelly = 0.0
+
+    while True:
+        if time.monotonic() >= next_jelly:
+            next_jelly = time.monotonic() + 30
+            try:
+                jelly_misses = jelly_cleanup(jelly_misses)
+            except Exception as exc:  # noqa: BLE001
+                log("tv", "уборка плеера не удалась (%r)" % (exc,))
+                jelly_misses = 0
+        try:
+            cur = tv_is_on()
+        except Exception as exc:  # noqa: BLE001
+            log("tv", "ошибка проверки: %r" % (exc,))
+            time.sleep(CHECK_EVERY)
+            continue
+
+        if known is None or cur != known:
+            same += 1
+            if known is None or same >= NEED_CONFIRM:
+                known = cur
+                same = 0
+                log("tv", "телевизор %s → интерфейс %s"
+                    % ("включён" if cur else "выключен", "поднят" if cur else "погашен"))
+                try:
+                    set_interface("on" if cur else "off")  # powersave сразу
+                except Exception as exc:  # noqa: BLE001
+                    log("tv", "powersave не сработал (%r)" % (exc,))
+                off_since = None if cur else time.time()
+                warned = False
+                if cur:
+                    try:
+                        switch_to_stb_input()
+                    except Exception as exc:  # noqa: BLE001
+                        log("tv", "вход не переключился (%r)" % (exc,))
+        else:
+            same = 0
+
+        if (not cur and POWEROFF_AFTER > 0 and off_since is not None
+                and not ssh_session_active()):
+            left = POWEROFF_AFTER - (time.time() - off_since)
+            if left <= 0:
+                poweroff("телевизор выключен дольше %d с" % POWEROFF_AFTER)
+                off_since = time.time()
+                warned = False
+            elif left <= 60 and not warned:
+                warned = True
+                log("tv", "приставка выключится через %d с" % int(left))
+
+        time.sleep(CHECK_EVERY)
+
+
+# ═══════════════════════════════════════════════════════════ звук
+DESIRED_SPEAKER = stbconf.get("TV_SPEAKER", "")
+SPEAKER_CHECK = int(stbconf.get("TV_SPEAKER_CHECK", "30") or 30)
+
+
+def watch_audio():
+    if not DESIRED_SPEAKER:
+        log("audio", "TV_SPEAKER не задан — сторожу нечего держать, выхожу")
+        return
+    log("audio", "слежу за звуком: нужен %s, проверка раз в %d с" % (DESIRED_SPEAKER, SPEAKER_CHECK))
+    while True:
+        state = daemon_ask({"cmd": "state"}).get("state") or {}
+        # погашенный экран трогать нельзя: смена выхода звука будила телевизор
+        if state.get("power") == "Active":
+            current = state.get("sound")
+            if current and current != DESIRED_SPEAKER:
+                log("audio", "выход звука был %s → возвращаю %s" % (current, DESIRED_SPEAKER))
+                daemon_ask({"cmd": "speaker", "id": DESIRED_SPEAKER})
+                time.sleep(2)
+                again = (daemon_ask({"cmd": "state"}).get("state") or {}).get("sound")
+                log("audio", "после переключения: %s" % again)
+        time.sleep(SPEAKER_CHECK)
+
+
+# ═══════════════════════════════════════════════════════════ WoL
+WOL_IN = os.environ.get("WOL_IN") or stbconf.get("LAN_IF", "wlp2s0")
+WOL_OUT = os.environ.get("WOL_OUT") or stbconf.get("TV_IF", "enp0s25")
+WOL_BCAST = os.environ.get("WOL_BCAST") or stbconf.broadcast()
+TV_MAC = (os.environ.get("TV_MAC") or stbconf.get("TV_MAC", "")).strip().lower()
+TV_MAC_ALT = (os.environ.get("TV_MAC_ALT") or stbconf.get("TV_MAC_ALT", "")).strip().lower()
+PORTS = (9, 7)
+
+
+def wol_burst(sock, payload, times=5, gap=1.0):
+    """LG просыпается не с первого пакета: отправляем серию."""
+    def run():
+        for i in range(times):
+            for port in PORTS:
+                try:
+                    sock.sendto(payload, (WOL_BCAST, port))
+                    sock.sendto(payload, (TV, port))
+                except OSError:
+                    pass
+            if i + 1 < times:
+                time.sleep(gap)
+
+    threading.Thread(target=run, daemon=True).start()
+
+
+def bind_to_device(sock, dev):
+    sock.setsockopt(socket.SOL_SOCKET, 25, dev.encode() + b"\x00")   # SO_BINDTODEVICE
+
+
+def parse_magic(data):
+    if len(data) != 102 or data[:6] != b"\xff" * 6:
+        return None
+    mac = data[6:12]
+    for i in range(16):
+        if data[6 + i * 6: 12 + i * 6] != mac:
+            return None
+    return ":".join(f"{b:02x}" for b in mac)
+
+
+def watch_wol():
+    out = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    out.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+    out.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    bind_to_device(out, WOL_OUT)
+
+    socks = []
+    for port in PORTS:
+        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_BROADCAST, 1)
+        try:
+            bind_to_device(s, WOL_IN)
+        except OSError as exc:
+            log("wol", "не смог привязаться к %s: %s" % (WOL_IN, exc))
+        try:
+            s.bind(("", port))
+        except OSError as exc:
+            log("wol", "порт %d занят: %s" % (port, exc))
+            continue
+        socks.append((port, s))
+    if not socks:
+        log("wol", "не удалось открыть ни одного порта — выхожу")
+        return
+
+    log("wol", "слушаю %s:%s, повторяю в %s" % (WOL_IN, PORTS, WOL_OUT))
+    while True:
+        ready, _, _ = select.select([s for _, s in socks], [], [], 30)
+        for port, s in socks:
+            if s not in ready:
+                continue
+            try:
+                data, addr = s.recvfrom(2048)
+            except OSError:
+                continue
+            mac = parse_magic(data)
+            if not mac:
+                continue
+            is_wired = bool(TV_MAC) and mac == TV_MAC
+            is_wifi = bool(TV_MAC_ALT) and mac == TV_MAC_ALT
+            if not (is_wired or is_wifi):
+                log("wol", "пакет для %s — не телевизор, пропускаю" % mac)
+                continue
+            payload = data
+            target = mac
+            if is_wifi:
+                # пакет адресован Wi-Fi: внутри чужой MAC, собираем новый для провода
+                wired = TV_MAC.replace(":", "")
+                if len(wired) != 12:
+                    log("wol", "для %s: не задан проводной MAC (TV_MAC), пропускаю" % mac)
+                    continue
+                target = ":".join(wired[i:i + 2] for i in range(0, 12, 2))
+                payload = b"\xff" * 6 + bytes.fromhex(wired) * 16
+            wol_burst(out, payload)
+            how = "пересобрал для провода" if is_wifi else "повторил как есть"
+            log("wol", "пакет для %s → %s: %s, отправил серию из 5 (пришёл от %s:%s)"
+                % (mac, target, how, addr[0], port))
+
+
+# ═══════════════════════════════════════════════════════════ кнопка корпуса
+HOLD = 2.0
+
+
+def watch_chassis():
+    """Физическая кнопка питания: короткое нажатие гасит коробку.
+
+    logind игнорирует KEY_POWER (чтобы кнопка на BT-пульте управляла телевизором),
+    поэтому корпусную кнопку ловим сами.
+    """
+    try:
+        import evdev
+        from evdev import ecodes
+    except ImportError:
+        log("chassis", "нужен python3-evdev — кнопку корпуса не слушаю")
+        return
+
+    devs = []
+    for path in evdev.list_devices():
+        try:
+            dev = evdev.InputDevice(path)
+        except OSError:
+            continue
+        if "Power Button" in (dev.name or ""):
+            devs.append(dev)
+    if not devs:
+        log("chassis", "устройство 'Power Button' не найдено — не слушаю")
+        return
+
+    log("chassis", "слушаю " + ", ".join("%s(%s)" % (d.path, d.name) for d in devs))
+    sel = selectors.DefaultSelector()
+    for dev in devs:
+        sel.register(dev, selectors.EVENT_READ)
+    pressed_at = None
+    while True:
+        for key, _ in sel.select(timeout=1.0):
+            dev = key.fileobj
+            try:
+                for ev in dev.read():
+                    if ev.type != ecodes.EV_KEY or ev.code != ecodes.KEY_POWER:
+                        continue
+                    if ev.value == 1:
+                        pressed_at = time.monotonic()
+                    elif ev.value == 0 and pressed_at is not None:
+                        held = time.monotonic() - pressed_at
+                        pressed_at = None
+                        if held < HOLD:
+                            log("chassis", "короткое нажатие %.2fs → poweroff" % held)
+                            subprocess.run(["/usr/bin/systemctl", "poweroff"])
+                        else:
+                            log("chassis", "удержание %.2fs → отдал logind" % held)
+            except OSError:
+                sel.unregister(dev)
+
+
+# ═══════════════════════════════════════════════════════════ запуск
+# ═══════════════════════════════════════════════════════════ Bluetooth: сопряжение
+BT_AGENT_PATH = "/stb/btagent"
+BT_AGENT_IFACE = "org.bluez.Agent1"
+BT_CAPABILITY = "NoInputNoOutput"
+PAIR_WINDOW = "/run/stb/pair_until"
+
+
+def pair_window_open():
+    """Окно сопряжения открыто? Его пишет stb pair на время."""
+    try:
+        until = float(open(PAIR_WINDOW, encoding="utf-8").read().strip())
+    except (OSError, ValueError):
+        return False
+    return time.time() <= until
+
+
+def watch_bt_agent():
+    """Агент BlueZ: подтверждает сопряжение только в окне, иначе отказывает."""
+    import dbus
+    import dbus.mainloop.glib
+    import dbus.service
+    from gi.repository import GLib
+
+    dbus.mainloop.glib.DBusGMainLoop(set_as_default=True)
+    bus = dbus.SystemBus()
+
+    class Agent(dbus.service.Object):
+        def __init__(self):
+            super().__init__(bus, BT_AGENT_PATH)
+
+        def _is_known(self, device):
+            try:
+                obj = bus.get_object("org.bluez", device)
+                props = dbus.Interface(obj, "org.freedesktop.DBus.Properties")
+                info = props.GetAll("org.bluez.Device1")
+                return bool(info.get("Paired", False) or info.get("Trusted", False))
+            except Exception:  # noqa: BLE001
+                return False
+
+        def _check(self, what, device):
+            device = str(device)
+            if pair_window_open():
+                log("bt", "%s: %s → подтверждено (окно открыто)" % (what, device))
+                return
+            if self._is_known(device):
+                log("bt", "%s: %s → подтверждено (уже сопряжён)" % (what, device))
+                return
+            log("bt", "%s: %s → ОТКАЗ (окно сопряжения закрыто)" % (what, device))
+            raise dbus.exceptions.DBusException(
+                "pairing window closed", name="org.bluez.Error.Rejected")
+
+        @dbus.service.method(BT_AGENT_IFACE, in_signature="", out_signature="")
+        def Release(self):
+            pass
+
+        @dbus.service.method(BT_AGENT_IFACE, in_signature="os", out_signature="")
+        def AuthorizeService(self, device, uuid):
+            self._check("AuthorizeService", device)
+
+        @dbus.service.method(BT_AGENT_IFACE, in_signature="o", out_signature="")
+        def RequestAuthorization(self, device):
+            self._check("RequestAuthorization", device)
+
+        @dbus.service.method(BT_AGENT_IFACE, in_signature="ou", out_signature="")
+        def RequestConfirmation(self, device, passkey):
+            self._check("RequestConfirmation(код %06d)" % int(passkey), device)
+
+        @dbus.service.method(BT_AGENT_IFACE, in_signature="o", out_signature="s")
+        def RequestPinCode(self, device):
+            self._check("RequestPinCode", device)
+            return dbus.String("0000")
+
+        @dbus.service.method(BT_AGENT_IFACE, in_signature="o", out_signature="u")
+        def RequestPasskey(self, device):
+            self._check("RequestPasskey", device)
+            return dbus.UInt32(0)
+
+        @dbus.service.method(BT_AGENT_IFACE, in_signature="ouq", out_signature="")
+        def DisplayPasskey(self, device, passkey, entered):
+            log("bt", "DisplayPasskey %s %06d" % (device, int(passkey)))
+
+        @dbus.service.method(BT_AGENT_IFACE, in_signature="os", out_signature="")
+        def DisplayPinCode(self, device, pincode):
+            log("bt", "DisplayPinCode %s %s" % (device, pincode))
+
+        @dbus.service.method(BT_AGENT_IFACE, in_signature="", out_signature="")
+        def Cancel(self):
+            log("bt", "Cancel")
+
+    Agent()
+    manager = dbus.Interface(bus.get_object("org.bluez", "/org/bluez"),
+                             "org.bluez.AgentManager1")
+    try:
+        manager.UnregisterAgent(BT_AGENT_PATH)
+    except dbus.DBusException:
+        pass
+    manager.RegisterAgent(BT_AGENT_PATH, BT_CAPABILITY)
+    manager.RequestDefaultAgent(BT_AGENT_PATH)
+    log("bt", "агент сопряжения зарегистрирован: только в окне")
+    GLib.MainLoop().run()
+
+
+# ═══════════════════════════════════════════════════════════ Bluetooth: журнал нажатий
+def watch_bt_log():
+    """Пишет в buttons.log, что реально присылает телефон (ничего не перехватывает)."""
+    import evdev
+    from evdev import ecodes
+
+    def open_devs():
+        devs = []
+        for path in evdev.list_devices():
+            try:
+                dev = evdev.InputDevice(path)
+            except OSError:
+                continue
+            caps = dev.capabilities()
+            keys = caps.get(ecodes.EV_KEY, [])
+            rels = caps.get(ecodes.EV_REL, [])
+            has_btn = any(c in keys for c in (ecodes.BTN_LEFT, ecodes.BTN_TOUCH, ecodes.BTN_MOUSE))
+            has_move = ecodes.REL_X in rels and ecodes.REL_Y in rels
+            if dev.info.bustype == 0x05 and (has_btn or has_move):
+                devs.append(dev)
+        return devs
+
+    devs = open_devs()
+    log("bt-log", "старт: %s" % [d.name for d in devs])
+    last_scan = time.time()
+    last_move = 0.0
+    while True:
+        if time.time() - last_scan > 10:
+            last_scan = time.time()
+            fresh = {d.path: d for d in open_devs()}
+            if set(fresh) != {d.path for d in devs}:
+                devs = list(fresh.values())
+                log("bt-log", "устройства: %s" % [d.name for d in devs])
+        if not devs:
+            time.sleep(1)
+            continue
+        ready, _, _ = select.select(devs, [], [], 1.0)
+        for dev in ready:
+            try:
+                for ev in dev.read():
+                    if ev.type == ecodes.EV_KEY:
+                        name = ecodes.bytype[ecodes.EV_KEY].get(ev.code, str(ev.code))
+                        log("bt-log", "%s %s %s" % (dev.name[:18], name, ev.value))
+                    elif ev.type == ecodes.EV_REL and ev.code in (ecodes.REL_X, ecodes.REL_Y):
+                        if time.time() - last_move > 1.0:
+                            log("bt-log", "%s движение" % dev.name[:18])
+                            last_move = time.time()
+            except OSError:
+                devs.remove(dev)
+
+
+# ═══════════════════════════════════════════════════════════ Bluetooth: редкие клавиши
+EXTRA_KEYS = {}
+
+
+def watch_bt_keys():
+    """Клавиши с кодами больше 255: X их не принимает, ловим прямо из /dev/input."""
+    import evdev
+    from evdev import ecodes
+
+    EXTRA_KEYS.update({ecodes.KEY_APPSELECT: "layout", ecodes.KEY_CONTROLPANEL: "toggle"})
+    env = {"DISPLAY": ":0", "XAUTHORITY": os.path.join(STB_HOME, ".Xauthority"), "HOME": STB_HOME}
+
+    def keyboards():
+        out = []
+        for path in evdev.list_devices():
+            try:
+                dev = evdev.InputDevice(path)
+            except OSError:
+                continue
+            if dev.info.bustype == 0x05 and ecodes.KEY_A in dev.capabilities().get(ecodes.EV_KEY, []):
+                out.append(dev)
+        return out
+
+    def current_layout():
+        try:
+            with open("/run/stb/lang", encoding="utf-8") as f:
+                return f.read().strip() or "us"
+        except OSError:
+            return "us"
+
+    def toggle_layout():
+        new = "en" if current_layout() == "ru" else "ru"
+        try:
+            subprocess.run(["/opt/stb/bin/stb", "lang", new], env=dict(os.environ, **env),
+                           timeout=8, capture_output=True)
+        except subprocess.TimeoutExpired:
+            log("bt-keys", "переключатель раскладки не ответил за 8 с")
+        log("bt-keys", "раскладка → %s" % new)
+        try:
+            with open("/run/stb/lastkey", "w", encoding="utf-8") as f:
+                f.write("%s [nuc] раскладка: %s" % (time.strftime("%F %T"),
+                                                    "РУС" if new == "ru" else "ENG"))
+        except OSError:
+            pass
+
+    def toggle_tv():
+        log("bt-keys", "ползунки → переключение приставка/телевизор")
+        subprocess.run(["/opt/stb/bin/stb", "toggle"], env=dict(os.environ, **env),
+                       timeout=60, capture_output=True)
+
+    devs = keyboards()
+    log("bt-keys", "слушаю: %s" % [(d.name, d.path) for d in devs])
+    last_scan = time.time()
+    while True:
+        if time.time() - last_scan > 15:
+            last_scan = time.time()
+            fresh = {d.path: d for d in keyboards()}
+            if set(fresh) != {d.path for d in devs}:
+                devs = list(fresh.values())
+                log("bt-keys", "устройства: %s" % [d.name for d in devs])
+        if not devs:
+            time.sleep(1)
+            continue
+        ready, _, _ = select.select(devs, [], [], 1.0)
+        for dev in ready:
+            try:
+                for ev in dev.read():
+                    if ev.type == ecodes.EV_KEY and ev.value == 1 and ev.code in EXTRA_KEYS:
+                        action = EXTRA_KEYS[ev.code]
+                        if action == "layout":
+                            toggle_layout()
+                        elif action == "toggle":
+                            toggle_tv()
+            except OSError:
+                devs = [x for x in devs if x.path != dev.path]
+
+
+# ═══════════════════════════════════════════════════════════ Bluetooth: указатель
+POINTER_MATCH = os.environ.get("POINTER_MATCH", "")   # пусто = любой BT-пульт
+POINTER_ONLY_BT = os.environ.get("POINTER_ONLY_BT", "1") != "0"
+BT_BUS = 0x05
+POINTER_HZ = 25
+
+
+def watch_bt_pointer():
+    """Тачпад BT-пульта → курсор телевизора, только в режиме «ТВ»."""
+    import asyncio
+    import glob
+
+    import evdev
+    from evdev import ecodes
+    from stbtv import TvDaemon
+
+    for extra in glob.glob(os.path.join(STB_HOME, "tvctl", "lib", "python3*", "site-packages")):
+        sys.path.insert(0, extra)
+
+    def candidates():
+        found = {}
+        for path in evdev.list_devices():
+            try:
+                dev = evdev.InputDevice(path)
+            except OSError:
+                continue
+            rel = dev.capabilities().get(ecodes.EV_REL, [])
+            if not (ecodes.REL_X in rel and ecodes.REL_Y in rel):
+                continue
+            name = dev.name or ""
+            if POINTER_MATCH and POINTER_MATCH.lower() not in name.lower():
+                continue
+            if POINTER_ONLY_BT and dev.info.bustype != BT_BUS:
+                continue
+            found[path] = dev
+        return found
+
+    async def watch():
+        devices = {}
+        client = None
+        dx = dy = 0
+        last = 0.0
+        interval = 1.0 / POINTER_HZ
+        next_scan = 0.0
+
+        while True:
+            now = time.monotonic()
+            if now >= next_scan:
+                next_scan = now + 5
+                fresh = candidates()
+                for path, dev in fresh.items():
+                    if path not in devices:
+                        devices[path] = dev
+                        log("bt-pointer", "слушаю: %s (%s)" % (dev.name, path))
+                for path in list(devices):
+                    if path not in fresh:
+                        log("bt-pointer", "отключилось: %s" % path)
+                        devices.pop(path, None)
+                if not devices:
+                    await asyncio.sleep(1)
+                    continue
+
+            if current_mode() != "tv":
+                # События в режиме nuc не нужны, но очередь устройств надо
+                # вычитывать: иначе при переходе в tv прилетят накопленные
+                # движения и нажатия.
+                try:
+                    ready, _, _ = await asyncio.get_running_loop().run_in_executor(
+                        None, lambda: select.select(list(devices.values()), [], [], 0))
+                    for dev in ready:
+                        dev.read()
+                except Exception:  # noqa: BLE001
+                    pass
+                await asyncio.sleep(0.2)
+                continue
+
+            try:
+                ready, _, _ = await asyncio.get_running_loop().run_in_executor(
+                    None, lambda: select.select(list(devices.values()), [], [], 0.2))
+            except Exception:  # noqa: BLE001
+                await asyncio.sleep(0.2)
+                continue
+
+            for dev in ready:
+                try:
+                    for ev in dev.read():
+                        if client is None:
+                            try:
+                                client = TvDaemon()
+                                log("bt-pointer", "подключился к ТВ через демон")
+                            except Exception as exc:  # noqa: BLE001
+                                log("bt-pointer", "не подключиться к ТВ: %s" % exc)
+                                await asyncio.sleep(2)
+                                break
+                        if ev.type == ecodes.EV_REL:
+                            if ev.code == ecodes.REL_X:
+                                dx += ev.value
+                            elif ev.code == ecodes.REL_Y:
+                                dy += ev.value
+                            elif ev.code == ecodes.REL_WHEEL:
+                                await client.scroll(0, -ev.value * 2)
+                        elif ev.type == ecodes.EV_KEY and ev.code == ecodes.BTN_LEFT and ev.value == 1:
+                            await client.click()
+                        if (dx or dy) and (time.monotonic() - last) >= interval:
+                            await client.move(dx, dy)
+                            dx = dy = 0
+                            last = time.monotonic()
+                except OSError:
+                    devices.pop(dev.path, None)
+                except Exception as exc:  # noqa: BLE001
+                    log("bt-pointer", "ошибка связи (%s) — переподключаюсь" % exc)
+                    client = None
+
+    asyncio.run(watch())
+
+
+SECTIONS = {
+    "tv": watch_tv,
+    "audio": watch_audio,
+    "wol": watch_wol,
+    "chassis": watch_chassis,
+    "bt-agent": watch_bt_agent,
+    "bt-log": watch_bt_log,
+    "bt-keys": watch_bt_keys,
+    "bt-pointer": watch_bt_pointer,
+}
+
+
+def serve(name):
+    """Держать раздел запущенным: упал — поднимаем снова."""
+    func = SECTIONS[name]
+    while True:
+        try:
+            log(name, "запущен")
+            func()
+            log(name, "завершился сам")
+        except SystemExit:
+            return
+        except Exception as exc:  # noqa: BLE001
+            import traceback
+            log(name, "упал (%r), перезапуск через %d с" % (exc, RESTART_AFTER))
+            for line in traceback.format_exc().splitlines():
+                log(name, "   " + line)
+        time.sleep(RESTART_AFTER)
+
+
+def main(argv):
+    what = (argv[1] if len(argv) > 1 else "all").strip().lower()
+    if what in ("-h", "--help", "help"):
+        print(__doc__.strip())
+        return 0
+    if what != "all" and what not in SECTIONS:
+        print("разделы: all, %s" % ", ".join(SECTIONS), file=sys.stderr)
+        return 2
+
+    names = list(SECTIONS) if what == "all" else [what]
+    if len(names) == 1:
+        serve(names[0])          # одиночный раздел — без потоков, удобно отлаживать
+        return 0
+
+    log("chassis", "старт: %d сторожа в одной программе" % len(names))
+    threads = []
+    for name in names:
+        t = threading.Thread(target=serve, args=(name,), name=name, daemon=True)
+        t.start()
+        threads.append(t)
+    while True:
+        time.sleep(30)
+        if not [t for t in threads if t.is_alive()]:
+            log("chassis", "все сторожа встали — выхожу")
+            return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv))

@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Приставка</title>
+<style>
+  :root { color-scheme: dark; }
+  * { box-sizing: border-box; }
+  /* Высота через 100% от html, а не 100vh: vh считается от окна браузера и
+     при скрытых панелях/масштабе даёт лишние десятки пикселей — из-за этого
+     шапка уезжала за верхний край, а нижний ряд обрезался. */
+  html, body { height: 100%; }
+  body {
+    margin: 0; overflow: hidden; font-family: system-ui, "DejaVu Sans", sans-serif;
+    background: radial-gradient(circle at 30% 15%, #1b2740, #090c12 70%);
+    color: #eef4ff; display: flex; flex-direction: column;
+  }
+  header { flex: 0 0 auto; padding: 14px 34px 0; display: flex; justify-content: space-between; align-items: baseline; }
+  h1 { font-size: 30px; font-weight: 600; margin: 0; color: #9fb3d1; letter-spacing: .5px; }
+  .hdr { display: flex; gap: 26px; align-items: baseline; }
+  #lang { font-size: 26px; font-weight: 700; color: #8ad6a0; letter-spacing: .06em; }
+  #clock { font-size: 30px; color: #9fb3d1; font-variant-numeric: tabular-nums; }
+  main { flex: 1; min-height: 0; display: flex; padding: 8px 30px 26px; overflow: hidden; }
+  .grid { flex: 1; display: grid; grid-template-columns: repeat(4, 1fr); grid-auto-rows: minmax(0, 1fr);
+          gap: 20px; width: min(1700px, 100%); margin: 0 auto; }
+  a.tile {
+    display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 12px;
+    border-radius: 20px; min-height: 0; overflow: hidden; text-decoration: none; color: inherit;
+    background: rgba(255,255,255,.07); border: 1px solid rgba(255,255,255,.12);
+    transition: transform .12s ease, background .12s ease; cursor: pointer;
+  }
+  /* Наведение курсором теперь = выбор плитки (см. selectTile), поэтому
+     отдельная подсветка по :hover не нужна: видна только одна — выбранная. */
+  a.tile:hover, a.tile:focus { outline: none; }
+  .ico { display: flex; align-items: center; justify-content: center; height: var(--ico, 88px); flex: 0 0 auto; }
+  .ico img { width: var(--ico, 88px); height: var(--ico, 88px); object-fit: contain; display: block; }
+  .ico .emoji { font-size: calc(var(--ico, 88px) * 0.82); line-height: 1; }
+  .lbl { font-size: var(--lbl, 37px); font-weight: 600; text-align: center; line-height: 1.15; }
+  .sub { font-size: var(--sub, 23px); color: #c2d2e6; text-align: center; }
+  #status { position: fixed; left: 50%; bottom: 26px; z-index: 50; max-width: 84%; transform: translateX(-50%);
+            background: rgba(0,0,0,.75); padding: 14px 26px; border-radius: 12px;
+            font-size: 26px; opacity: 0; transition: opacity .2s; pointer-events: none; }
+  #status.show { opacity: 1; }
+
+  a.tile.sel, a.tile:focus {
+    outline: 4px solid #8ad6a0;
+    outline-offset: 4px;
+    transform: scale(1.04);
+  }
+  /* Подтверждение опасного действия: окно поверх сетки, управление пультом. */
+  #confirm { position: fixed; inset: 0; display: none; align-items: center; justify-content: center;
+             background: rgba(4, 8, 14, .78); z-index: 100; }
+  #confirm.show { display: flex; }
+  body.modal-open a.tile.sel, body.modal-open a.tile:focus { outline: none; }
+  #confirm .box { background: #16203a; border: 1px solid rgba(255,255,255,.18); border-radius: 24px;
+                  padding: 44px 56px; text-align: center; box-shadow: 0 24px 70px rgba(0,0,0,.6); }
+  #confirm h2 { font-size: 44px; margin: 0 0 34px; font-weight: 600; color: #eef4ff; }
+  #confirm .row { display: flex; gap: 28px; justify-content: center; }
+  #confirm button { font: inherit; font-size: 34px; font-weight: 600; padding: 22px 54px;
+                    border-radius: 18px; border: 2px solid rgba(255,255,255,.25);
+                    background: rgba(255,255,255,.08); color: #eef4ff; cursor: pointer; }
+  #confirm button.focus { border-color: #8ad6a0; background: rgba(138,214,160,.18); }
+  #confirm button.danger.focus { border-color: #ff8f8f; background: rgba(255,143,143,.18); }
+</style>
+</head>
+<body>
+<header><h1>Приставка</h1><div class="hdr"><span id="lang" title="раскладка клавиатуры">—</span><div id="clock"></div></div></header>
+<div id="confirm">
+  <div class="box">
+    <h2 id="confirm-title">Выключить?</h2>
+    <div class="row">
+      <button id="confirm-no" type="button">Отмена</button>
+      <button id="confirm-yes" class="danger" type="button">Выключить</button>
+    </div>
+  </div>
+</div>
+<main><div class="grid" id="grid"></div></main>
+<div id="status"></div>
+
+<script>
+const statusEl = document.getElementById('status');
+function status(msg) {
+  statusEl.textContent = msg;
+  statusEl.classList.add('show');
+  clearTimeout(statusEl._t);
+  statusEl._t = setTimeout(() => statusEl.classList.remove('show'), 4000);
+}
+function tick() {
+  const d = new Date(), p = n => String(n).padStart(2, '0');
+  document.getElementById('clock').textContent = p(d.getHours()) + ':' + p(d.getMinutes());
+}
+setInterval(tick, 5000); tick();
+
+function runTile(b) {
+  status(b.label + '…');
+  fetch('/run/' + encodeURIComponent(b.id))
+    .then(r => r.json())
+    .then(j => status(b.label + (j.ok ? ': ' + (j.msg || 'запущено') : ' — ошибка: ' + j.msg)))
+    .catch(e => status('ошибка: ' + e));
+}
+
+function render() {
+fetch('/api/buttons').then(r => r.json()).then(list => {
+  const grid = document.getElementById('grid');
+  grid.innerHTML = '';
+  for (const b of list) {
+    const a = document.createElement('a');
+    a.className = 'tile';
+    a.href = b.type === 'url' ? b.target : '#';
+    // Ссылка открывается в новой вкладке: сетка остаётся первой вкладкой,
+    // к ней возвращаются кликом по вкладке или кнопкой Home.
+    if (b.type === 'url') { a.target = '_blank'; a.rel = 'noopener'; }
+    const ico = b.img
+      ? '<img src="' + b.img + '" alt="">'
+      : '<span class="emoji">' + (b.icon || '▶') + '</span>';
+    a.innerHTML = '<div class="ico">' + ico + '</div>' +
+                  '<div class="lbl">' + b.label + '</div>' +
+                  (b.sub ? '<div class="sub">' + b.sub + '</div>' : '');
+    if (b.type === 'command') {
+      a.addEventListener('click', ev => {
+        ev.preventDefault();
+        if (b.confirm) { askConfirm(b); return; }
+        runTile(b);
+      });
+    }
+    const idx = list.indexOf(b);
+    // Наведение курсором = выбор этой плитки: стрелки продолжают с неё,
+    // и подсветка одна, а не две разные.
+    a.addEventListener('mouseenter', () => selectTile(idx));
+    grid.appendChild(a);
+  }
+  fitTiles(list.length);
+  // после отрисовки выбор = плитка под курсором (иначе первая стрелка
+  // прыгала на первую плитку, хотя курсор стоял на другой)
+  selectTile(tileUnderPointer());
+}).catch(e => status('не загрузились кнопки: ' + e));
+}
+render();
+// список кнопок подхватывается сам, без перезагрузки страницы
+setInterval(render, 60000);
+
+// Индикатор раскладки в шапке: видно всегда, без всплывающих подсказок.
+function pollLang() {
+  fetch('/lang/status').then(r => r.json()).then(j => {
+    const el = document.getElementById('lang');
+    if (!el) return;
+    const ru = j.layout === 'ru';
+    el.textContent = ru ? 'РУС' : 'ENG';
+    el.style.color = ru ? '#8ad6a0' : '#9fb3d1';
+  }).catch(() => {});
+}
+pollLang(); setInterval(pollLang, 1500);
+
+// Подгоняем размер значков и подписей под количество рядов: сколько бы плиток
+// ни добавили, всё влезает в экран без прокрутки.
+function fitTiles(count) {
+  const rows = Math.ceil(count / 4);
+  const sizes = { 1: [112, 46, 27], 2: [104, 42, 24], 3: [88, 38, 22], 4: [58, 32, 19], 5: [46, 27, 16], 6: [40, 23, 14] };
+  const [ico, lbl, sub] = sizes[Math.min(rows, 6)] || sizes[6];
+  const r = document.documentElement.style;
+  r.setProperty('--ico', ico + 'px');
+  r.setProperty('--lbl', lbl + 'px');
+  r.setProperty('--sub', sub + 'px');
+}
+
+
+
+// ---- Навигация стрелками по сетке (стрелки приходят с пульта) --------------
+let sel = -1;
+
+// Сколько сейчас столбцов в сетке (верстка задаёт это в CSS).
+function gridColumns() {
+  const g = document.querySelector('.grid');
+  if (!g) return 4;
+  const tpl = getComputedStyle(g).gridTemplateColumns || '';
+  const n = tpl.split(' ').filter(Boolean).length;
+  return n > 0 ? n : 4;
+}
+function tiles() { return Array.from(document.querySelectorAll('a.tile')); }
+
+// Плитка под курсором: с неё начинается выбор стрелками, иначе — первая.
+function tileUnderPointer() {
+  const t = tiles();
+  if (ptrSeen) {
+    const el = document.elementFromPoint(ptrX, ptrY);
+    const a = el && el.closest ? el.closest('a.tile') : null;
+    const i = t.indexOf(a);
+    if (i >= 0) return i;
+  }
+  return 0;
+}
+
+function selectTile(i) {
+  const t = tiles();
+  if (!t.length || i < 0 || i >= t.length) return;
+  sel = i;
+  t.forEach((x, n) => x.classList.toggle('sel', n === sel));
+  t[sel].focus();
+  const r = t[sel].getBoundingClientRect();
+  ptrX = r.left + r.width / 2;
+  ptrY = r.top + r.height / 2;
+  ptrSeen = true;
+}
+
+function moveSelection(step) {
+  const t = tiles();
+  if (!t.length) return;
+  if (sel < 0) {
+    sel = tileUnderPointer();
+    selectTile(sel);
+    return;
+  } else {
+    const n = sel + step;
+    if (n < 0 || n >= t.length) return;
+    sel = n;
+  }
+  t.forEach((x, i) => x.classList.toggle('sel', i === sel));
+  t[sel].focus();
+  // Курсор «наводим» на выбранную плитку: так OK открывает именно её.
+  const r = t[sel].getBoundingClientRect();
+  ptrX = r.left + r.width / 2;
+  ptrY = r.top + r.height / 2;
+  ptrSeen = true;
+}
+// ---- Подтверждение опасных плиток (confirm: true в tiles.json)
+const confirmEl = document.getElementById('confirm');
+const confirmBtns = [document.getElementById('confirm-no'), document.getElementById('confirm-yes')];
+let confirmState = null;
+
+function paintConfirm() {
+  confirmBtns.forEach((el, i) => el.classList.toggle('focus', i === confirmState.focus));
+  clearTimeout(confirmState.timer);
+  confirmState.timer = setTimeout(closeConfirm, 10000);   // само закроется и ничего не сделает
+}
+
+function askConfirm(tile) {
+  confirmState = { tile: tile, focus: 0, timer: 0, sel: sel };
+  document.body.classList.add('modal-open');
+  document.getElementById('confirm-title').textContent = tile.label + '?';
+  confirmEl.classList.add('show');
+  paintConfirm();
+}
+
+function closeConfirm() {
+  if (!confirmState) return;
+  clearTimeout(confirmState.timer);
+  const was = confirmState.sel;
+  confirmState = null;
+  confirmEl.classList.remove('show');
+  document.body.classList.remove('modal-open');
+  if (typeof was === 'number' && was >= 0) selectTile(was);   // выбор вернулся на плитку
+}
+
+function confirmChoose() {
+  const tile = confirmState.tile;
+  closeConfirm();
+  runTile(tile);
+}
+
+confirmBtns[0].addEventListener('click', closeConfirm);
+confirmBtns[1].addEventListener('click', confirmChoose);
+
+document.addEventListener('keydown', e => {
+  if (!confirmState) return;
+  if (e.key === 'ArrowLeft' || e.key === 'ArrowRight') {
+    e.preventDefault();
+    confirmState.focus = 1 - confirmState.focus;
+    paintConfirm();
+    e.stopPropagation();
+    return;
+  }
+  if (e.key === 'Enter') {
+    e.preventDefault();
+    if (confirmState.focus === 0) closeConfirm(); else confirmChoose();
+    e.stopPropagation();
+    return;
+  }
+  if (e.key === 'Escape' || e.key === 'Backspace' || (e.altKey && e.key === 'ArrowLeft')) {
+    e.preventDefault();
+    closeConfirm();
+  }
+}, true);      // раньше обработчиков сетки: пока окно открыто, сетка не листается
+
+document.addEventListener('keydown', e => {
+  if (confirmState) return;          // окно открыто — сетка не листается
+  const cols = gridColumns();
+  const steps = { ArrowUp: -cols, ArrowDown: cols, ArrowLeft: -1, ArrowRight: 1,
+                  PageDown: cols, PageUp: -cols };
+  if (e.key in steps) {
+    e.preventDefault();
+    moveSelection(steps[e.key]);
+  }
+});
+
+// ---- Enter (⏯ на пульте) открывает плитку под курсором ----------------------
+let ptrX = 0, ptrY = 0, ptrSeen = false;
+document.addEventListener('mousemove', e => {
+  ptrX = e.clientX; ptrY = e.clientY; ptrSeen = true;
+  // Курсор = позиция выбора: куда указывает, там и «стоим».
+  const el = document.elementFromPoint(ptrX, ptrY);
+  const a = el && el.closest ? el.closest('a.tile') : null;
+  const t = tiles();
+  const i = t.indexOf(a);
+  if (i >= 0 && i !== sel) selectTile(i);
+});
+document.addEventListener('keydown', e => {
+  if (confirmState) return;
+  if (e.key !== 'Enter' || !ptrSeen) return;
+  const el = document.elementFromPoint(ptrX, ptrY);
+  const tile = el && el.closest ? el.closest('a.tile') : null;
+  if (!tile) return;
+  e.preventDefault();
+  tile.click();
+});
+
+// ---- показываем, что нажато на пульте (проверка, что кнопки доходят) --------
+let lastKeyTs = 0;
+let keyTimer = null;
+function pollKey() {
+  fetch('/api/lastkey').then(r => r.json()).then(j => {
+    if (!j.ok || !j.ts || j.ts === lastKeyTs) return;
+    lastKeyTs = j.ts;
+    const text = (j.line || '').replace(/^.*?\]\s*/, '');   // убрать «дата [режим]»
+    if (!text) return;
+    status(text);
+    if (keyTimer) clearTimeout(keyTimer);
+    keyTimer = setTimeout(() => status(''), 2500);
+  }).catch(() => {});
+}
+setInterval(pollKey, 800);
+</script>
+</body>
+</html>

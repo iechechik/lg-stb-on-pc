@@ -1,0 +1,555 @@
+#!/usr/bin/env python3
+import sys
+sys.path.insert(0, "/opt/stb/lib")
+import stbconf  # noqa: E402
+from stbtv import TvDaemon  # noqa: E402
+_stbconf = stbconf
+STB_HOME = _stbconf.get("STB_HOME", "/home/stbuser")
+STB_USER = _stbconf.get("STB_USER", "stbuser")
+
+"""stb-wifi-remote — приёмник кнопок и указателя от приложения-пульта (AirMouse).
+
+Приложение думает, что говорит с телевизором LG (SSAP по Wi-Fi).
+Мы представляемся телевизором и получаем ВСЁ:
+  * кнопки (стрелки, OK, цифры, громкость, каналы, медиа, меню, питание);
+  * указатель тачпада и аэромышки (движение, тап, прокрутка).
+
+Дальше сами решаем, кому это адресовано:
+  * режим «приставка» (nuc) — кнопки через stb-key-action, курсор через xdotool;
+  * режим «телевизор» (tv)  — кнопки через tv, курсор через демон телевизора.
+
+Всё пишется в /var/log/stb/faketv.log
+"""
+import asyncio
+import json
+import threading
+import uuid as _uuid
+import io
+import os
+import re
+import socket
+import struct
+import subprocess
+import time
+sys.path.insert(0, "/opt/stb/lib")
+
+
+import glob as _glob
+_HOME = STB_HOME
+for _p in _glob.glob(os.path.join(STB_HOME, "tvctl", "lib", "python3*", "site-packages")):
+    sys.path.insert(0, _p)
+
+LAN_IP = os.environ.get("FAKETV_IP") or stbconf.own_ip()
+PORT = int(os.environ.get("FAKETV_PORT") or stbconf.get("WF_PORT", "3000"))
+LOG = "/var/log/stb/faketv.log"
+MODE_FILE = "/run/stb/mode"
+KEY_FILE = f"{STB_HOME}/.aiopylgtv.sqlite"
+MANIFEST = f"{STB_HOME}/tvctl/nuc_manifest.json"
+TV_IP = os.environ.get("TV_IP") or stbconf.get("TV_IP", "")
+SEND_HZ = 25
+
+UUID = stbconf.get("WF_UUID", "").strip()   # пусто — придумаем при старте
+ST_LG = "urn:lge-com:service:webos-second-screen:1"
+ST_RENDERER = "urn:schemas-upnp-org:device:MediaRenderer:1"
+
+
+def load_keymap():
+    """Карта кнопок: /opt/stb/config/buttons-wifi.conf (ИМЯ=ДЕЙСТВИЕ)."""
+    path = os.path.join(stbconf.get("STB_CONFIG_DIR", "/opt/stb/config"),
+                        "buttons-wifi.conf")
+    table = {}
+    try:
+        with open(path, encoding="utf-8") as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                name, action = line.split("=", 1)
+                name = name.strip().upper()
+                action = action.strip()
+                if name and action:
+                    table[name] = action
+    except OSError as exc:
+        w(f"карта кнопок не прочитана ({path}): {exc} — работаю по пустой")
+    return table
+
+
+KEYS = load_keymap()
+
+
+def w(msg):
+    # миллисекунды: по этому журналу меряем темп двойных нажатий
+    stamp = time.strftime("%H:%M:%S") + f".{int(time.time() * 1000) % 1000:03d}"
+    with open(LOG, "a", buffering=1, encoding="utf-8") as f:
+        f.write(f"{stamp} {msg}\n")
+
+
+def ensure_uuid(current):
+    """Идентификатор приставки в SSDP. Не задан — придумываем и записываем в конфиг.
+
+    Придумывается один раз: от него зависит, видит ли приложение «телевизор»
+    как новое устройство.
+    """
+    if current:
+        return current
+    value = "uuid:" + str(_uuid.uuid4())
+    path = stbconf.CONFIG
+    try:
+        text = io.open(path, encoding="utf-8").read()
+        if re.search(r"^WF_UUID=", text, re.M):
+            text = re.sub(r"^WF_UUID=.*$", 'WF_UUID="%s"' % value, text, count=1, flags=re.M)
+        else:
+            text = text.rstrip("\n") + '\nWF_UUID="%s"\n' % value
+        io.open(path, "w", encoding="utf-8").write(text)
+        w(f"WF_UUID не задан — придумал {value} и записал в конфиг")
+    except OSError as exc:
+        w(f"WF_UUID не задан, придумал {value}, записать не смог: {exc}")
+    return value
+
+
+def mode():
+    try:
+        with open(MODE_FILE, encoding="utf-8") as f:
+            return f.read().strip() or "nuc"
+    except OSError:
+        return "nuc"
+
+
+def on_grid():
+    """Открыта ли наша сетка (по заголовку активного окна)."""
+    try:
+        r = subprocess.run(["xdotool", "getactivewindow", "getwindowname"],
+                           capture_output=True, timeout=5,
+                           env={**os.environ, "DISPLAY": ":0", "HOME": STB_HOME,
+                                "XAUTHORITY": f"{STB_HOME}/.Xauthority"})
+        return "Приставка" in r.stdout.decode("utf-8", "replace")
+    except Exception:  # noqa: BLE001
+        return False
+
+
+def run(cmd):
+    """Запускает команду и пишет в журнал ошибки — молчание тут дорого стоит."""
+    try:
+        r = subprocess.run(cmd, capture_output=True, timeout=15,
+                           env={**os.environ, "DISPLAY": ":0",
+                                "HOME": STB_HOME,
+                                "XAUTHORITY": f"{STB_HOME}/.Xauthority"})
+        if r.returncode != 0 or r.stderr:
+            err = r.stderr.decode("utf-8", "replace").strip()[:200]
+            w(f"    {cmd[0]} код {r.returncode}: {err}")
+    except Exception as exc:  # noqa: BLE001
+        w(f"    не смог выполнить {cmd[0]}: {exc}")
+
+
+ASYNC_ENV = {**os.environ, "DISPLAY": ":0", "HOME": STB_HOME,
+             "XAUTHORITY": os.path.join(STB_HOME, ".Xauthority")}
+
+
+async def arun(cmd, timeout=25):
+    """Запуск внешней программы без блокировки цикла событий.
+
+    Раньше subprocess.run стоял прямо в обработчике WebSocket: пока шла
+    команда телевизору (1–3 с), у приложения вставали пинги, курсор и
+    остальные кнопки.
+    """
+    try:
+        proc = await asyncio.create_subprocess_exec(
+            *cmd, stdout=asyncio.subprocess.DEVNULL,
+            stderr=asyncio.subprocess.PIPE, env=ASYNC_ENV)
+        try:
+            _, err = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            proc.kill()
+            w(f"    {cmd[0]}: не ответил за {timeout} с")
+            return False
+        if proc.returncode not in (0, None):
+            msg = (err or b"").decode("utf-8", "replace").strip()[:160]
+            w(f"    {cmd[0]} код {proc.returncode}: {msg}")
+            return False
+        return True
+    except Exception as exc:  # noqa: BLE001
+        w(f"    не смог выполнить {cmd[0]}: {exc}")
+        return False
+
+
+def _wait_seconds():
+    """Сколько держать одиночный Back: пауза и окно двойного — берём большее."""
+    try:
+        hold = float(stbconf.get("BACK_HOLD", "1.0"))
+    except ValueError:
+        hold = 1.0
+    try:
+        double = float(stbconf.get("DOUBLE_BACK", "1.0"))
+    except ValueError:
+        double = 1.0
+    return max(hold, double)
+
+
+def _send_back_later():
+    """Придержать одиночный Back: при двойном нажатии он не должен уйти в ТВ."""
+    timer = threading.Timer(_wait_seconds(), _send_back_now)
+    timer.daemon = True
+    BACK_PENDING[0] = timer
+    timer.start()
+
+
+def _send_back_now():
+    BACK_PENDING[0] = None
+    BACK_GATE.fired()
+    if LOOP[0] is not None:
+        LOOP[0].call_soon_threadsafe(lambda: asyncio.ensure_future(do_action("back")))
+
+
+async def do_action(name):
+    name = (name or "").strip()
+    if not name:
+        return
+    act = KEYS.get(name.upper(), name.lower())
+
+    # В режиме телевизора большинство кнопок — одна команда демону.
+    # Раньше здесь запускались два процесса (stb-key-action и внутри него tv).
+    if mode() == "tv":
+        req = stbkeys.request(act)
+        if req is not None:
+            resp = await TV_DAEMON.aask(req, timeout=4)
+            if resp.get("ok"):
+                stbkeys.log_line(act)
+                w(f"    кнопка {name} -> {act} (демон)")
+                return
+            w(f"    демон не принял {act}: {resp.get('msg', '')}")
+
+    await arun(["/opt/stb/bin/stb", "key", act])
+    w(f"    кнопка {name} -> {act}")
+
+
+# --------------------------------------------------------------- указатель
+TV_DAEMON = TvDaemon()
+from stbx11 import open_pointer  # noqa: E402
+from stbback import BackGate  # noqa: E402
+from stbws import ws_accept, ws_frame, read_ws_message  # noqa: E402
+from stbtext import TextBuffer  # noqa: E402
+from stbpointer import Pointer  # noqa: E402
+import stbkeys  # noqa: E402
+
+# ---- настройки и состояние приёмника
+# В сетке двойной клик тап-пада приходит двумя кликами и открывает плитку дважды.
+# Склеиваем такие пары в один; в приложениях двойной клик оставляем как есть.
+CLICK_GAP = float(stbconf.get("CLICK_GAP", "0.35"))
+# Приложение на одно нажатие присылает событие дважды (в одну секунду).
+# Без фильтра одно нажатие Back = два шага назад, а в ТВ — «двойной Back».
+DUP_GAP = float(stbconf.get("DUP_GAP", "0.1"))
+RAW_LOG = str(stbconf.get("STB_LOG_RAW", "0")).strip() in ("1", "on", "true", "yes")
+LAST_PRESS = {}
+LAST_CLICK = [0.0]
+
+# ---- объекты
+X11 = open_pointer()   # указатель на самом экране (XTest); None — тогда xdotool
+TV_DAEMON_OBJ = TV_DAEMON
+PTR = Pointer(run=arun, mode=mode, tv=TV_DAEMON_OBJ, x11=X11, log=w,
+              send_hz=SEND_HZ, click_gap=CLICK_GAP, on_grid=on_grid)
+TEXT = TextBuffer(run=arun, mode=mode, log=w)      # буфер текста с телефона
+BACK_PENDING = [None]
+BACK_GATE = BackGate(dup_gap=float(stbconf.get("BACK_DUP_GAP", "0.12")))
+LOOP = [None]   # цикл событий: таймер Back живёт в отдельном потоке
+
+
+# --------------------------------------------------------------- буфер текста
+# --------------------------------------------------------------- описание
+DESC = f"""<?xml version="1.0" encoding="utf-8"?>
+<root xmlns="urn:schemas-upnp-org:device-1-0">
+  <specVersion><major>1</major><minor>0</minor></specVersion>
+  <device>
+    <deviceType>urn:schemas-upnp-org:device:MediaRenderer:1</deviceType>
+    <friendlyName>{stbconf.get("WF_NAME", "home-tvbox1-wifi")}</friendlyName>
+    <manufacturer>LG Electronics</manufacturer>
+    <manufacturerURL>http://www.lg.com</manufacturerURL>
+    <modelDescription>LG Smart TV</modelDescription>
+    <modelName>webOS TV</modelName>
+    <modelNumber>OLED55C9PUA</modelNumber>
+    <serialNumber>FAKE0001</serialNumber>
+    <UDN>{UUID}</UDN>
+    <serviceList>
+      <service>
+        <serviceType>{ST_LG}</serviceType>
+        <serviceId>urn:lge-com:serviceId:webos-second-screen-1</serviceId>
+        <controlURL>/</controlURL>
+        <eventSubURL>/</eventSubURL>
+        <SCPDURL>/</SCPDURL>
+      </service>
+    </serviceList>
+  </device>
+</root>
+"""
+
+SYSTEM_INFO = {
+    "returnValue": True,
+    "features": {"3d": False, "dvr": False},
+    "receiverType": stbconf.get("TV_RECEIVER_TYPE", "dvb"),
+    "modelName": stbconf.get("TV_MODEL", "49UK6450PLC"),
+    "programMode": "true",
+}
+
+
+def ssdp_packet(st):
+    return (
+        "HTTP/1.1 200 OK\r\nCACHE-CONTROL: max-age=1800\r\n"
+        f"DATE: {time.strftime('%a, %d %b %Y %H:%M:%S GMT', time.gmtime())}\r\n"
+        "EXT:\r\n"
+        f"LOCATION: http://{LAN_IP}:{PORT}/\r\n"
+        "SERVER: WebOS/1.0 UPnP/1.0 webOS.TV-2024/1.0\r\n"
+        f"ST: {st}\r\n"
+        f"USN: {UUID}::{st}\r\n\r\n"
+    ).encode()
+
+
+async def ssdp_server():
+    if str(stbconf.get("WF_DISCOVER", "1")).strip() in ("0", "no", "off", "false"):
+        w("SSDP: выключен конфигом (WF_DISCOVER=0) — приложение подключается по адресу")
+        return
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+    sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    try:
+        sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+    except OSError:
+        pass
+    sock.bind(("0.0.0.0", 1900))
+    sock.setsockopt(socket.IPPROTO_IP, socket.IP_ADD_MEMBERSHIP,
+                    struct.pack("4sl", socket.inet_aton("239.255.255.250"), socket.INADDR_ANY))
+    sock.setblocking(False)
+    loop = asyncio.get_running_loop()
+    w("SSDP: слушаю 1900")
+    while True:
+        data, addr = await loop.sock_recvfrom(sock, 4096)
+        text = data.decode("utf-8", "replace")
+        if not text.startswith("M-SEARCH"):
+            continue
+        st = ""
+        for line in text.splitlines():
+            if line.lower().startswith("st:"):
+                st = line.split(":", 1)[1].strip()
+        answers = []
+        if "ssdp:all" in st or ST_LG in st:
+            answers.append(ST_LG)
+        if "ssdp:all" in st or ST_RENDERER in st:
+            answers.append(ST_RENDERER)
+        for a in answers:
+            await loop.sock_sendto(sock, ssdp_packet(a), addr)
+
+
+def ssap_reply(msg_id, payload):
+    return json.dumps({"type": "response", "id": msg_id, "payload": payload})
+
+
+def field(text, key):
+    for line in text.splitlines():
+        if line.startswith(key + ":"):
+            try:
+                return float(line.split(":", 1)[1].strip())
+            except ValueError:
+                return 0.0
+    return 0.0
+
+
+async def handle(reader, writer):
+    peer = writer.get_extra_info("peername")
+    try:
+        raw = await reader.readuntil(b"\r\n\r\n")
+    except Exception:
+        writer.close()
+        return
+    head = raw.decode("utf-8", "replace")
+    headers = {}
+    for line in head.split("\r\n")[1:]:
+        if ":" in line:
+            k, v = line.split(":", 1)
+            headers[k.strip().lower()] = v.strip()
+
+    if headers.get("upgrade", "").lower() != "websocket":
+        body = DESC.encode()
+        writer.write(b"HTTP/1.1 200 OK\r\nContent-Type: text/xml; charset=utf-8\r\n"
+                     + f"Content-Length: {len(body)}\r\nConnection: close\r\n\r\n".encode() + body)
+        await writer.drain()
+        writer.close()
+        return
+
+    writer.write(b"HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\n"
+                 b"Connection: Upgrade\r\nSec-WebSocket-Accept: "
+                 + ws_accept(headers.get("sec-websocket-key", "")).encode() + b"\r\n\r\n")
+    await writer.drain()
+    w(f"WS: подключился {peer[0]} ({head.split(chr(13))[0]})")
+
+    while True:
+        try:
+            opcode, payload = await read_ws_message(reader)
+        except Exception:
+            w("WS: клиент отключился")
+            break
+        if opcode == 8:
+            w("WS: клиент закрыл соединение")
+            break
+        if opcode == 9:
+            # ping от приложения: без pong клиент считает связь потерянной
+            # и переподключается (ровно каждые 20 секунд).
+            writer.write(ws_frame(payload, 0xA))
+            await writer.drain()
+            continue
+        if opcode == 10:
+            continue          # pong — просто подтверждение, делать нечего
+        if opcode not in (0x1, 0x2):
+            w(f"WS: кадр типа {opcode} — пропускаю")
+            continue
+
+        text = payload.decode("utf-8", "replace")
+        if not text.strip():
+            continue
+
+        # ---- события указателя
+        if text.startswith("type:move"):
+            PTR.add(field(text, "dx"), field(text, "dy"))
+            continue
+        if text.startswith("type:click"):
+            await PTR.click()
+            continue
+        if text.startswith("type:scroll"):
+            await PTR.scroll(field(text, "dy"))
+            continue
+
+        # ---- кнопки
+        if text.startswith("type:button"):
+            # Сырые сообщения нужны при разборе кнопок, в обычной работе это
+            # лишние строки в журнале. Включается STB_LOG_RAW=1 в конфиге.
+            if RAW_LOG:
+                w("RAW: " + text.replace(chr(10), " | ")[:300])
+            name = ""
+            for line in text.splitlines():
+                if line.startswith("name:"):
+                    name = line.split(":", 1)[1].strip()
+            # отсекаем дубль того же нажатия от приложения
+            _now = time.monotonic()
+            _prev = LAST_PRESS.get(name)
+            LAST_PRESS[name] = _now
+            if name != "BACK" and _prev is not None and _now - _prev <= DUP_GAP:
+                w(f"КНОПКА: {name} (дубль отброшен, {int((_now - _prev) * 1000)} мс)")
+                continue
+
+            if name == "BACK":
+                now = time.monotonic()
+                # приложение шлёт одно нажатие дважды — склеиваем события
+                if BACK_GATE.duplicate(now):
+                    w("КНОПКА: BACK (повтор того же нажима)")
+                    continue
+
+                if mode() == "tv":
+                    if BACK_GATE.press() == "tobox":
+                        # второй нажим: возврат на приставку, в телевизор не уходит
+                        if BACK_PENDING[0] is not None:
+                            BACK_PENDING[0].cancel()
+                            BACK_PENDING[0] = None
+                        BACK_GATE.cancel()
+                        w("КНОПКА: BACK ×2 → на приставку (без Back в ТВ)")
+                        await do_action("tobox")
+                    else:
+                        w("КНОПКА: BACK (жду второй)")
+                        _send_back_later()
+                else:
+                    w("КНОПКА: BACK")
+                    await do_action("back")
+                continue
+            w(f"КНОПКА: {name}")
+            await do_action(name)
+            continue
+
+        # ---- текст с клавиатуры телефона
+        if text.startswith("type:text") or text.startswith("type:string"):
+            w(f"ТЕКСТ: {text[:100]}")
+            continue
+
+        if text.startswith("type:"):
+            w(f"СООБЩЕНИЕ: {text.replace(chr(10), ' | ')[:120]}")
+            continue
+
+        # ---- запросы SSAP
+        try:
+            req = json.loads(text)
+        except Exception:
+            w(f"непонятно: {text[:120]}")
+            continue
+
+        kind, mid, uri = req.get("type"), req.get("id"), req.get("uri", "")
+        if kind == "register":
+            writer.write(ws_frame(json.dumps({
+                "type": "registered", "id": mid,
+                "payload": {"client-key": "fake-client-key-0001"}})))
+            await writer.drain()
+            w("РЕГИСТРАЦИЯ: подтвердил")
+        elif "getSystemInfo" in uri:
+            writer.write(ws_frame(ssap_reply(mid, SYSTEM_INFO)))
+            await writer.drain()
+            w("ЗАПРОС: getSystemInfo → ответил")
+        elif "ime/insertText" in uri:
+            payload = req.get("payload") or {}
+            txt = payload.get("text", "")
+            w(f"ТЕКСТ-ПАКЕТ: {json.dumps(payload, ensure_ascii=False)[:200]} (режим {mode()})")
+            if txt:
+                TEXT.feed(txt)
+            writer.write(ws_frame(ssap_reply(mid, {"returnValue": True})))
+            await writer.drain()
+        elif "ime/sendEnterKey" in uri:
+            TEXT.flush()
+            if mode() == "tv":
+                await arun(["/opt/stb/bin/stb", "tv", "text", "--enter"])
+            else:
+                await arun(["xdotool", "key", "--clearmodifiers", "Return"])
+            w(f"ВВОД: Enter (режим {mode()})")
+            writer.write(ws_frame(ssap_reply(mid, {"returnValue": True})))
+            await writer.drain()
+        elif "ime/deleteCharacters" in uri:
+            count = (req.get("payload") or {}).get("count", 1) or 1
+            TEXT.flush()
+            TEXT.last = ""
+            if mode() == "tv":
+                await arun(["/opt/stb/bin/stb", "tv", "text", "--delete", str(int(count))])
+            else:
+                await arun(["xdotool", "key", "--clearmodifiers", "--repeat",
+                            str(int(count)), "BackSpace"])
+            w(f"ВВОД: стёр {count} симв. (режим {mode()})")
+            writer.write(ws_frame(ssap_reply(mid, {"returnValue": True})))
+            await writer.drain()
+        elif "system/turnOff" in uri:
+            w("ПИТАНИЕ: приложение просит выключить — выключаю телевизор")
+            await arun(["/opt/stb/bin/stb", "key", "power"])
+            writer.write(ws_frame(ssap_reply(mid, {"returnValue": True})))
+            await writer.drain()
+        elif "system/turnOn" in uri or "tv.power/turnOn" in uri:
+            w("ПИТАНИЕ: приложение просит включить — включаю телевизор")
+            await arun(["/opt/stb/bin/stb", "key", "power"])
+            writer.write(ws_frame(ssap_reply(mid, {"returnValue": True})))
+            await writer.drain()
+        elif "getPointerInputSocket" in uri:
+            writer.write(ws_frame(ssap_reply(mid, {
+                "socketPath": f"ws://{LAN_IP}:{PORT}/pointer", "returnValue": True})))
+            await writer.drain()
+            w("ЗАПРОС: канал для кнопок → выдал")
+        else:
+            writer.write(ws_frame(ssap_reply(mid, {"returnValue": True})))
+            await writer.drain()
+            w(f"ЗАПРОС: {uri}")
+
+    writer.close()
+
+
+async def main():
+    LOOP[0] = asyncio.get_running_loop()
+    os.makedirs(os.path.dirname(LOG), exist_ok=True)
+    w(f"=== старт {LAN_IP}:{PORT} (режим: {mode()}) ===")
+    PTR.start()
+    server = await asyncio.start_server(handle, "0.0.0.0", PORT)
+    asyncio.create_task(ssdp_server())
+    async with server:
+        await server.serve_forever()
+
+
+UUID = ensure_uuid(UUID)   # после определения w() и ensure_uuid()
+
+if __name__ == "__main__":
+    asyncio.run(main())

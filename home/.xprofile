@@ -1,0 +1,3 @@
+export XCURSOR_THEME=Adwaita
+export XCURSOR_SIZE=64
+xrdb -merge "$HOME/.Xresources" 2>/dev/null

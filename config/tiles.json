@@ -1,0 +1,136 @@
+[
+  {
+    "id": "jellyfin-nuc",
+    "label": "Jellyfin",
+    "sub": "Медиаплеер встроенный",
+    "icon": "🎬",
+    "img": "icons/jellyfin.png",
+    "type": "command",
+    "target": "/opt/stb/bin/stb player"
+  },
+  {
+    "id": "jellyfin-tv",
+    "label": "Jellyfin",
+    "sub": "Медиаплеер телевизора",
+    "icon": "📺",
+    "img": "icons/television.png",
+    "type": "command",
+    "target": "/opt/stb/bin/stb jelly"
+  },
+  {
+    "id": "tv-mode",
+    "label": "Телевизор",
+    "sub": "эфир ТВ и пульт в ТВ",
+    "icon": "📺",
+    "img": "icons/television.png",
+    "type": "command",
+    "target": "/opt/stb/bin/stb live"
+  },
+  {
+    "id": "youtube",
+    "label": "YouTube",
+    "icon": "▶️",
+    "img": "icons/youtube.png",
+    "type": "url",
+    "target": "https://www.youtube.com"
+  },
+  {
+    "id": "sonarr",
+    "label": "Sonarr",
+    "sub": "Скачиваем сериалы",
+    "icon": "🗂",
+    "img": "icons/sonarr.png",
+    "type": "url",
+    "target": "http://misc.local:9095"
+  },
+  {
+    "id": "radarr",
+    "label": "Radarr",
+    "sub": "Скачиваем фильмы",
+    "icon": "🎞",
+    "img": "icons/radarr.png",
+    "type": "url",
+    "target": "http://misc.local:9094"
+  },
+  {
+    "id": "seerr",
+    "label": "Seerr",
+    "sub": "Заявки на медиа",
+    "icon": "🔎",
+    "img": "icons/seerr.png",
+    "type": "url",
+    "target": "http://misc.local:9099"
+  },
+  {
+    "id": "prowlarr",
+    "label": "Prowlarr",
+    "sub": "Поиск на трекерах",
+    "icon": "🎞",
+    "img": "icons/prowlarr.png",
+    "type": "url",
+    "target": "http://misc.local:9094"
+  },
+  {
+    "id": "browser",
+    "label": "Браузер",
+    "sub": "Firefox: поиск и сайты",
+    "icon": "🧭",
+    "img": "icons/browser.png",
+    "type": "url",
+    "target": "https://www.google.com/"
+  },
+  {
+    "id": "filebrowser",
+    "label": "FileBrowser",
+    "sub": "Домашний Архив",
+    "icon": "🎞",
+    "img": "icons/filebrowser.png",
+    "type": "url",
+    "target": "http://misc.local:8080"
+  },
+  {
+    "id": "pair-remote",
+    "label": "Добавить BT-пульт",
+    "sub": "сопряжение телефона",
+    "icon": "📱",
+    "img": "icons/bluetooth.png",
+    "type": "command",
+    "target": "/opt/stb/bin/stb pair 180"
+  },
+  {
+    "id": "tv-off",
+    "confirm": true,
+    "label": "Выключить ТВ",
+    "icon": "⏻",
+    "img": "icons/power-off.png",
+    "type": "command",
+    "target": "tv off"
+  },
+  {
+    "id": "stb-off",
+    "confirm": true,
+    "label": "Выключить приставку",
+    "icon": "⏻",
+    "img": "icons/power-off.png",
+    "type": "command",
+    "target": "/opt/stb/bin/stb poweroff --now"
+  },
+  {
+    "id": "lang",
+    "label": "Раскладка РУС/ENG",
+    "sub": "переключить",
+    "icon": "RU",
+    "img": "icons/keyboard.png",
+    "type": "command",
+    "target": "/opt/stb/bin/stb lang toggle"
+  },
+  {
+    "id": "buttons",
+    "label": "Кнопки",
+    "sub": "что нажимать",
+    "icon": "⌨",
+    "img": "icons/keyboard.png",
+    "type": "url",
+    "target": "http://127.0.0.1:8090/buttons"
+  }
+]

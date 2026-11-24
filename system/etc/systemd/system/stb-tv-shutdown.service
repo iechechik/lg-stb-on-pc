@@ -1,0 +1,17 @@
+[Unit]
+Description=STB: при выключении погасить телевизор
+DefaultDependencies=no
+Wants=network-online.target
+After=network-online.target NetworkManager.service
+Before=shutdown.target reboot.target halt.target
+Conflicts=shutdown.target reboot.target halt.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/true
+ExecStop=/opt/stb/bin/stb tv shutdown
+TimeoutStopSec=30
+
+[Install]
+WantedBy=multi-user.target

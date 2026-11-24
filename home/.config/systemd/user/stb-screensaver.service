@@ -1,0 +1,16 @@
+[Unit]
+Description=STB: гашение экрана по простою
+PartOf=stb-browser.service
+
+[Service]
+Type=simple
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/home/stbuser/.Xauthority
+Environment=HOME=/home/stbuser
+StandardOutput=append:/var/log/stb/screensaver.log
+ExecStart=/opt/stb/bin/stb screensaver
+Restart=always
+RestartSec=3
+
+[Install]
+WantedBy=default.target

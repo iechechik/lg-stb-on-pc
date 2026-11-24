@@ -1,0 +1,7 @@
+[Unit]
+Description=STB: весь комплекс приставки (пульт, телевизор, звук, сеть)
+Wants=stb-watch.service stb-wifi-remote.service stb-nic-watch.timer stb-tv-boot.service stb-tv-shutdown.service stb-nic-tune.service stb-tv-link.service
+After=network-online.target bluetooth.target
+
+[Install]
+WantedBy=multi-user.target

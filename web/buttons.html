@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="ru">
+<head>
+<meta charset="utf-8">
+<title>Кнопки и плитки</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; padding: 48px 64px 80px; background: #0d1117; color: #e6edf3;
+         font-family: "DejaVu Sans", system-ui, sans-serif; }
+  h1 { font-size: 52px; margin: 0 0 8px; }
+  h2 { font-size: 34px; margin: 44px 0 14px; color: #8ab4f8; }
+  .hint { font-size: 22px; color: #9aa7b4; margin-bottom: 8px; }
+  table { border-collapse: collapse; width: 100%; font-size: 26px; }
+  td, th { text-align: left; padding: 12px 18px; border-bottom: 1px solid #21262d; vertical-align: top; }
+  th { font-size: 20px; color: #9aa7b4; text-transform: uppercase; letter-spacing: .08em; }
+  td.k { white-space: nowrap; color: #ffd479; font-weight: 600; width: 26%; }
+  td.n { white-space: nowrap; width: 24%; }
+  .small { font-size: 20px; color: #9aa7b4; margin-top: 28px; }
+  code { background: #161b22; padding: 2px 8px; border-radius: 6px; font-size: 22px; }
+</style>
+</head>
+<body>
+<h1>Кнопки пульта и плитки</h1>
+<div class="hint">Нажатие ⏯ действует на плитку, которая подсвечена (куда стоит курсор).</div>
+
+<h2>Кнопки телефона-пульта</h2>
+<table>
+<tr><th>Кнопка</th><th>На приставке</th><th>В режиме телевизора</th></tr>
+<tr><td class="k">⏻ Power</td><td colspan="2">Включает и выключает <b>только телевизор</b>. Приставку не трогает — её гасят кнопкой на корпусе.</td></tr>
+<tr><td class="k">＋ / −</td><td colspan="2">Громкость телевизора (звук идёт по HDMI на телик).</td></tr>
+<tr><td class="k">🔇 Mute</td><td colspan="2">Звук вкл/выкл.</td></tr>
+<tr><td class="k">⏮</td><td>влево (карусели, страницы)</td><td>влево в приложении LG</td></tr>
+<tr><td class="k">⏭</td><td>вправо</td><td>вправо в приложении LG</td></tr>
+<tr><td class="k">⏯</td><td><b>OK:</b> открывает подсвеченную плитку, в Jellyfin — выбрать/воспроизвести</td><td><b>ENTER</b> — подтвердить в приложении LG</td></tr>
+<tr><td class="k">🔍 лупа</td><td>страница вниз (Page Down)</td><td>вниз в приложении LG</td></tr>
+<tr><td class="k">☰ Меню</td><td>Escape — закрыть выпавшие меню</td><td>меню телевизора</td></tr>
+<tr><td class="k">↩ Back</td><td>назад в браузере</td><td>назад в приложении LG</td></tr>
+<tr><td class="k">🏠 Home</td><td colspan="2">Возвращает <b>на сетку приставки</b> (переключает телевизор на вход приставки).</td></tr>
+<tr><td class="k">▦ сетка (4 квадрата)</td><td colspan="2"><b>Переключить раскладку РУС ↔ ENG</b> — работает в любой вкладке и в любом месте, не только на странице поиска.</td></tr>
+<tr><td class="k">⚙ ползунки</td><td colspan="2"><b>Переключить приставка ↔ телевизор</b>: включает телевизор и Jellyfin на нём, повторное нажатие возвращает на приставку.</td></tr>
+<tr><td class="k">Тачпад</td><td>курсор приставки</td><td>курсор на телевизоре (если приложение его показывает)</td></tr>
+<tr><td class="k">Правая кнопка</td><td colspan="2">Правый клик. <b>Левая кнопка телефона не работает</b> — приложение не отправляет её; вместо клика жми ⏯.</td></tr>
+</table>
+
+<h2>Режимы приложения AirMouse</h2>
+<table>
+<tr><td class="k">Точпад</td><td>палец двигает курсор (основной режим)</td></tr>
+<tr><td class="k">Мышь</td><td>курсор двигается наклоном телефона, есть кнопки</td></tr>
+<tr><td class="k">Пульт</td><td>только кнопки: ⏮ ⏯ ⏭, громкость, Home, Back</td></tr>
+</table>
+
+<h2>Плитки</h2>
+<table>
+<tr><td class="k">Jellyfin — плеер коробки</td><td>Jellyfin Desktop на самой приставке (mpv + аппаратное декодирование)</td></tr>
+<tr><td class="k">Jellyfin — на телевизоре</td><td>Включает телевизор и запускает приложение Jellyfin на нём; пульт переходит в режим телевизора</td></tr>
+<tr><td class="k">Браузер</td><td>страница с поиском и закладками для YouTube и прочего</td></tr>
+<tr><td class="k">YouTube / Sonarr / Radarr / Seerr / Prowlarr</td><td>Открывают соответствующий сайт в браузере</td></tr>
+<tr><td class="k">Текст на ТВ</td><td>Поле для текста: набранное уходит в приложение телевизора через внутренний сервис ввода — кириллица работает так же, как с родного пульта LG.</td></tr>
+<tr><td class="k">Добавить пульт</td><td>Коробка становится видимой для сопряжения 180 секунд, потом гаснет сама</td></tr>
+<tr><td class="k">Выключить ТВ</td><td>Гасит телевизор</td></tr>
+</table>
+
+<div class="small">
+Файл с этим описанием: <code>/opt/stb-setup/KNOPKI.md</code> ·
+Правка плиток: <code>/opt/stb/web/buttons.json</code> (памятка <code>/opt/stb/web/PLITKI.md</code>)<br>
+Вернуться на сетку — кнопка <b>Home</b> или <a href="/" style="color:#8ab4f8">эта ссылка</a>.
+</div>
+</body>
+</html>

@@ -1,0 +1,13 @@
+[Unit]
+Description=STB web (сетка + переходник команд)
+After=graphical-session.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/stb/web
+ExecStart=/usr/bin/python3 /opt/stb/web/stb-web.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=default.target

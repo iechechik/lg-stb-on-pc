@@ -1,0 +1,13 @@
+[Unit]
+Description=STB: при загрузке включить телевизор и вход приставки
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/opt/stb/bin/stb boot
+TimeoutStartSec=180
+
+[Install]
+WantedBy=multi-user.target

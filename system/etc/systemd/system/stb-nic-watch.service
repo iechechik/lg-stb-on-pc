@@ -1,0 +1,7 @@
+[Unit]
+Description=STB: сторож зависаний сетевого чипа
+After=network.target
+
+[Service]
+Type=oneshot
+ExecStart=/opt/stb/bin/stb nic-watch

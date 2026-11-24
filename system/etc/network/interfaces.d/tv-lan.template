@@ -1,0 +1,8 @@
+# Интерфейс, в который включён телевизор.
+# Подставлено установщиком: имя интерфейса, адрес приставки в этой сети и адрес ТВ.
+auto @TV_IF@
+iface @TV_IF@ inet manual
+    up ip addr add @ADDR@/24 dev @TV_IF@ noprefixroute
+    up ip route add @TV_IP@/32 dev @TV_IF@
+    down ip route del @TV_IP@/32 dev @TV_IF@
+    down ip addr del @ADDR@/24 dev @TV_IF@

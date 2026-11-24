@@ -1,0 +1,14 @@
+[Unit]
+Description=STB: настройка enp0s25 против e1000e Hardware Unit Hang
+After=network.target
+Wants=network.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+# TSO/GSO выключены — известный триггер зависаний e1000e;
+# EEE выключен, RX-кольцо увеличено (rx_missed_errors).
+ExecStart=/bin/sh -c '/usr/sbin/ethtool -K enp0s25 tso off gso off; /usr/sbin/ethtool --set-eee enp0s25 eee off; /usr/sbin/ethtool -G enp0s25 rx 512; /usr/sbin/ethtool -s enp0s25 wol gub'
+
+[Install]
+WantedBy=multi-user.target

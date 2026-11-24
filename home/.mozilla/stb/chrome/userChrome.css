@@ -1,0 +1,14 @@
+/* Сетка приставки: главный экран без верхних строк.
+   Пока открыта ОДНА вкладка (сетка) — полоса вкладок и адресная строка
+   не показываются. Открылся сайт (вкладок стало две) — всё возвращается.
+   Механизм: :has() поддерживается начиная с Firefox 121. */
+
+:root:has(#tabbrowser-tabs .tabbrowser-tab:only-of-type) #TabsToolbar,
+:root:has(#tabbrowser-tabs .tabbrowser-tab:only-of-type) #nav-bar {
+  visibility: collapse !important;
+}
+
+/* Пока верхние строки скрыты, окно не должно прыгать по высоте. */
+:root:has(#tabbrowser-tabs .tabbrowser-tab:only-of-type) #navigator-toolbox {
+  border-bottom: none !important;
+}
