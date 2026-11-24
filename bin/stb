@@ -417,7 +417,11 @@ def cmd_hide(argv):
                            capture_output=True, text=True).stdout or "").strip()
     if not name or any(w in name for w in ("Приставка", "stb-web", "Mozilla Firefox")):
         return 0                      # сетку и браузер не прячем
-    subprocess.run(["wmctrl", "-i", "-r", win, "-b", "add,hidden"], env=env, capture_output=True)
+    hidden = subprocess.run(["wmctrl", "-i", "-r", win, "-b", "add,hidden"], env=env,
+                            capture_output=True)
+    if hidden.returncode != 0:
+        key_log("окно (%s) не скрылось — приложение оставляю на экране" % name[:40])
+        return 1
     try:
         with open(hidden_mark(), "w", encoding="utf-8") as f:
             f.write(name)
@@ -445,6 +449,22 @@ def hidden_check():
     except OSError:
         pass
     env = user_env()
+    # Окно могли вернуть мимо плитки (оконный менеджер, alt-tab). Тогда возраст
+    # отметки уже ничего не значит: человек смотрит, гасить нельзя.
+    wins = subprocess.run(["xdotool", "search", "--name", title], env=env,
+                          capture_output=True, text=True).stdout.split() if title else []
+    for wid in wins:
+        if not wid.isdigit():
+            continue
+        info = subprocess.run(["xwininfo", "-id", wid], env=env,
+                              capture_output=True, text=True)
+        if info.returncode == 0 and "IsViewable" in info.stdout:
+            try:
+                os.remove(mark)
+            except OSError:
+                pass
+            say("окно (%s) снова на экране — таймер снят" % title[:40])
+            return 0
     if "jellyfin" in title.lower():
         jelly_kill(env, "скрыто дольше %d мин" % minutes)
     elif title:
@@ -2109,6 +2129,12 @@ def cmd_screensaver(argv):
         own = tv_shows_own_app()
         if state != "on" or mode_get() != "nuc" or own is True:
             close_splash()
+            time.sleep(5)
+            continue
+        if own is None and not os.path.exists(opened_at):
+            # Не знаем, что показывает телевизор: новую заставку не открываем,
+            # иначе перекроем чужой фильм. Уже открытую не трогаем — короткий
+            # сбой связи не повод её закрывать.
             time.sleep(5)
             continue
 

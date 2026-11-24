@@ -69,7 +69,12 @@ def _drop_pending(key):
     _PENDING.pop(key, None)
 
 
-async def read_ws_message(reader, max_size=MAX_MESSAGE):
+def forget_ws_reader(reader):
+    """Забыть незавершённое сообщение этого соединения (зовётся при разрыве)."""
+    _PENDING.pop(id(reader), None)
+
+
+async def _read_message(reader, max_size=MAX_MESSAGE):
     """Сообщение целиком; управляющий кадр внутри сообщения не ломает сборку.
 
     Клиент вправе прислать PING между фрагментами (TEXT FIN=0, PING,
@@ -109,3 +114,17 @@ async def read_ws_message(reader, max_size=MAX_MESSAGE):
         if fin:
             _drop_pending(key)
             return state["opcode"], b"".join(state["parts"])
+
+
+async def read_ws_message(reader, max_size=MAX_MESSAGE):
+    """Чтение с очисткой: оборванное сообщение не остаётся в памяти.
+
+    Разрыв посреди фрагментированного сообщения поднимает исключение — без
+    очистки состояние сборки (до 1 МиБ плюс сам reader) копилось бы на каждое
+    такое подключение.
+    """
+    try:
+        return await _read_message(reader, max_size)
+    except Exception:
+        forget_ws_reader(reader)
+        raise

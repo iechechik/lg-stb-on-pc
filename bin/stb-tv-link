@@ -47,6 +47,7 @@ STATE = {"power": None, "sound": None, "app": None, "volume": None, "muted": Non
          "app_updated": None}
 _client = None
 _lock = asyncio.Lock()
+DROP_TIMEOUT = 2.0        # закрытие соединения не держит замок дольше
 
 
 def log(msg):
@@ -84,6 +85,14 @@ async def drop():
         except Exception:  # noqa: BLE001
             pass
         _client = None
+
+
+async def safe_drop(timeout=DROP_TIMEOUT):
+    """Закрыть соединение, не задерживая очередь: закрытие тоже с ограничением."""
+    try:
+        await asyncio.wait_for(drop(), timeout=timeout)
+    except Exception as exc:  # noqa: BLE001
+        log("соединение закрывалось дольше %.1f с (%s) — продолжаю" % (timeout, str(exc)[:60]))
 
 
 async def ensure():
@@ -238,30 +247,39 @@ async def dispatch(client, cmd, req):
 
 
 async def handle(req):
-    """Команда целиком под таймаутом: зависший запрос не держит очередь вечно."""
+    """Команда целиком в одном бюджете времени.
+
+    Очередь, подключение и выполнение тратят ОДИН срок `COMMAND_TIMEOUT`, а не
+    три независимых (было 6 + 5 + 6 = 17 с при клиентских 8 с). Иначе клиент
+    сдавался и повторял нажатие, пока демон ещё работал.
+    """
     cmd = (req or {}).get("cmd", "")
+    deadline = time.monotonic() + COMMAND_TIMEOUT
+
+    def left(minimum=0.1):
+        return max(minimum, deadline - time.monotonic())
+
     try:
-        await asyncio.wait_for(_lock.acquire(), timeout=COMMAND_TIMEOUT)
+        await asyncio.wait_for(_lock.acquire(), timeout=left())
     except asyncio.TimeoutError:
         log("команда %s ждала очередь дольше %.0f с" % (cmd, COMMAND_TIMEOUT))
         return {"ok": False, "msg": "демон занят другой командой"}
     try:
         try:
-            client = await asyncio.wait_for(ensure(), timeout=CONNECT_TIMEOUT)
+            client = await asyncio.wait_for(ensure(), timeout=left())
         except Exception as exc:  # noqa: BLE001
             log("соединение не установлено (%s)" % str(exc)[:80])
             return {"ok": False, "msg": "нет связи с телевизором"}
         try:
-            return await asyncio.wait_for(dispatch(client, cmd, req),
-                                          timeout=COMMAND_TIMEOUT)
+            return await asyncio.wait_for(dispatch(client, cmd, req), timeout=left())
         except asyncio.TimeoutError:
-            log("команда %s не ответила за %.0f с — переподключаюсь"
+            log("команда %s не уложилась в %.0f с — переподключаюсь"
                 % (cmd, COMMAND_TIMEOUT))
-            await drop()
+            await safe_drop()
             return {"ok": False, "msg": "телевизор не ответил"}
         except Exception as exc:  # noqa: BLE001
             log("команда %s не удалась (%s) — переподключаюсь" % (cmd, str(exc)[:80]))
-            await drop()
+            await safe_drop()
             return {"ok": False, "msg": str(exc)[:200]}
     finally:
         _lock.release()
@@ -326,7 +344,7 @@ async def refresh_sound():
         _lock.release()
         if dropped is not None:
             try:
-                await dropped.close()
+                await asyncio.wait_for(dropped.close(), timeout=DROP_TIMEOUT)
             except Exception:  # noqa: BLE001
                 pass
 

@@ -208,6 +208,25 @@ def _send_back_now():
         LOOP[0].call_soon_threadsafe(lambda: asyncio.ensure_future(do_action("back")))
 
 
+def daemon_alive():
+    """Служба демона запущена? Сокет может остаться от прошлого запуска."""
+    try:
+        out = subprocess.run(["systemctl", "is-active", "stb-tv-link"],
+                             capture_output=True, text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return False
+    return out.strip() == "active"
+
+
+def should_use_cli(resp):
+    """Прямой путь допустим только при недоступном демоне.
+
+    Отказ телевизора и молчание живого демона — не повод повторять: клиент уже
+    отправил нажатие, и повтор дал бы двойное срабатывание (Back, громкость).
+    """
+    return bool(resp.get("transport")) and not daemon_alive()
+
+
 async def do_action(name):
     name = (name or "").strip()
     if not name:
@@ -226,7 +245,17 @@ async def do_action(name):
                 stbkeys.log_line(act)
                 w(f"    кнопка {name} -> {act} (демон)")
                 return
-            w(f"    демон не принял {act}: {resp.get('msg', '')}")
+            if should_use_cli(resp):
+                # Демона нет вовсе — вот только здесь допустим прямой путь.
+                w(f"    демон не запущен — отправляю {act} напрямую")
+                await arun(["/opt/stb/bin/stb", "key", act])
+                return
+            # Демон ответил отказом (или жив, но молчит): повторять нельзя.
+            # Клиент уже отправил нажатие, демон может ещё его выполнять —
+            # повтор дал бы двойное срабатывание Back/громкости.
+            w(f"    демон не принял {act}: {resp.get('msg', '')} — повторять не буду")
+            stbkeys.log_line(act + " (не принято)")
+            return
 
     await arun(["/opt/stb/bin/stb", "key", act])
     w(f"    кнопка {name} -> {act}")
@@ -236,7 +265,7 @@ async def do_action(name):
 TV_DAEMON = TvDaemon()
 from stbx11 import open_pointer  # noqa: E402
 from stbback import BackGate  # noqa: E402
-from stbws import ws_accept, ws_frame, read_ws_message  # noqa: E402
+from stbws import forget_ws_reader, ws_accept, ws_frame, read_ws_message  # noqa: E402
 from stbtext import TextBuffer  # noqa: E402
 from stbpointer import Pointer  # noqa: E402
 import stbkeys  # noqa: E402
@@ -339,7 +368,7 @@ async def ssdp_server():
                 st = line.split(":", 1)[1].strip()
         answers = []
         if "ssdp:all" in st:
-            answers.extend([ST_LG, ST_RENDERER])
+            answers.extend(sorted(KNOWN_ST))
         elif st.strip() in KNOWN_ST:
             # Приложение-пульт делает несколько поисков и без ответа на свой тип
             # считает, что телевизора нет. Отвечаем тем же ST — но только на те,
@@ -398,6 +427,7 @@ async def handle(reader, writer):
             opcode, payload = await read_ws_message(reader)
         except Exception:
             w("WS: клиент отключился")
+            forget_ws_reader(reader)
             break
         if opcode == 8:
             w("WS: клиент закрыл соединение")

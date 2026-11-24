@@ -15,7 +15,6 @@
 Разделы независимы: падение одного не мешает остальным, каждый пишет свой журнал,
 который знает по прежнему имени (/var/log/stb/tvwatch.log и т.д.).
 """
-import json
 import os
 import select
 import selectors
@@ -27,6 +26,7 @@ import time
 
 sys.path.insert(0, "/opt/stb/lib")
 import stbconf  # noqa: E402
+from stbtv import TvDaemon  # noqa: E402
 
 LOGS = {
     "tv": "/var/log/stb/tvwatch.log",
@@ -61,6 +61,12 @@ TV = stbconf.get("TV_IP", "")
 TV_INPUT = stbconf.get("TV_INPUT_ID", "")
 INPUT_ON_WAKE = str(stbconf.get("TV_INPUT_ON_WAKE", "0")).strip() in ("1", "yes", "true")
 CHECK_EVERY = 4
+# Срок запроса к демону — как у остальных клиентов (8 с): демон тратит на
+# команду до 6 с, и короткий срок сторожа заставлял бы его сдаваться раньше
+# демона. Медленный ответ растягивает один тик, но только если телевизор
+# отвечает по сети (иначе SSAP вообще не спрашиваем) — это плата за
+# осмысленное решение вместо догадки.
+WATCH_TIMEOUT = 8.0
 NEED_CONFIRM = 2          # сколько одинаковых ответов подряд, чтобы поверить
 POWEROFF_AFTER = int(stbconf.get("IDLE_POWEROFF_AFTER", "0") or 0)
 DRY = str(stbconf.get("STB_POWEROFF_DRY", "0")).strip() in ("1", "yes", "true")
@@ -73,23 +79,17 @@ _net_misses = 0
 _last_on = None
 
 
-def daemon_ask(req, timeout=5.0):
-    """Запрос к демону телевизора: одно соединение на всю приставку."""
+def daemon_ask(req, timeout=WATCH_TIMEOUT):
+    """Запрос к демону через общий клиент `lib/stbtv.py`.
+
+    Своего сокет-кода здесь больше нет: сроки, формат ответа и признак
+    `transport` живут в одном месте. Ответ без `ok` считается отказом демона —
+    сторож тогда работает с «состояние неизвестно», а не с пустым словарём.
+    """
     try:
-        s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-        s.settimeout(timeout)
-        s.connect(DAEMON_SOCK)
-        s.sendall((json.dumps(req, ensure_ascii=False) + "\n").encode("utf-8"))
-        data = b""
-        while not data.endswith(b"\n"):
-            chunk = s.recv(65536)
-            if not chunk:
-                break
-            data += chunk
-        s.close()
-        return json.loads(data.decode("utf-8", "replace") or "{}")
+        return TvDaemon(DAEMON_SOCK).ask(req, timeout=timeout)
     except Exception:  # noqa: BLE001
-        return {}
+        return {"ok": False, "transport": True}
 
 
 def power_state():
@@ -104,7 +104,9 @@ def power_state():
     state = answer.get("state") or {}
     # Возраст берём у самого питания: ответ на вопрос о звуке или приложении не
     # делает состояние питания свежим, а сторож решает именно по нему.
-    stamp = state.get("power_updated") or state.get("updated")
+    # Только своя отметка питания: `updated` двигается и после команд (mute,
+    # vol), а это активность, а не подтверждение состояния телевизора.
+    stamp = state.get("power_updated")
     age = max(0.0, time.time() - float(stamp)) if stamp else None
     return (state.get("power") or ""), age
 
@@ -265,10 +267,13 @@ def jelly_has_window():
     env = {"DISPLAY": ":0", "XAUTHORITY": os.path.join(STB_HOME, ".Xauthority"),
            "HOME": STB_HOME}
     try:
-        out = subprocess.run(["wmctrl", "-l", "-x"], env=env, capture_output=True,
-                             text=True, timeout=10).stdout
+        done = subprocess.run(["wmctrl", "-l", "-x"], env=env, capture_output=True,
+                              text=True, timeout=10)
     except (OSError, subprocess.SubprocessError):
         return True                      # не смогли проверить — не трогаем
+    if done.returncode != 0:
+        return True                      # диагностика не сработала — не трогаем
+    out = done.stdout
     wins = [line.split()[0] for line in out.splitlines()
             if "jellyfin-desktop" in line.lower() and line.split()]
     if not wins:
@@ -276,10 +281,12 @@ def jelly_has_window():
     for wid in wins:
         try:
             info = subprocess.run(["xwininfo", "-id", wid], env=env, capture_output=True,
-                                  text=True, timeout=10).stdout
+                                  text=True, timeout=10)
         except (OSError, subprocess.SubprocessError):
             return True
-        if "IsViewable" in info:
+        if info.returncode != 0:
+            return True                  # окно не расспросили — не трогаем
+        if "IsViewable" in info.stdout:
             return True
     # Окно есть, но не показано: если это наше намеренное скрытие — не трогаем.
     return os.path.exists(os.path.join("/run/user/%d" % os.stat(STB_HOME).st_uid,
