@@ -1,14 +1,14 @@
-"""Документация должна соответствовать системе: пути, команды, юниты, параметры."""
+"""Документы не расходятся с системой: команды, пути, юниты, параметры."""
 import glob
 import io
 import os
+import pathlib
 import re
 import subprocess
 
-ROOT = os.environ.get("STB_ROOT", "/opt/stb")
-CFG = io.open(os.path.join(ROOT, "config/stb.conf"), encoding="utf-8").read()
+ROOT = pathlib.Path(os.environ.get("STB_ROOT", "/opt/stb"))
+CFG = io.open(os.path.join(str(ROOT), "config/stb.conf"), encoding="utf-8").read()
 KEYS = set(re.findall(r"^([A-Z][A-Z0-9_]+)=", CFG, re.M))
-
 KEYS_NAMES = {"BACK", "BLUE", "CHANNELDOWN", "CHANNELUP", "DOWN", "ENTER", "EXIT",
               "FASTFORWARD", "GREEN", "GUIDE", "INFO", "LEFT", "MENU", "MUTE",
               "PAUSE", "PLAY", "RED", "REWIND", "RIGHT", "SUBTITLE", "VOLUMEDOWN",
@@ -16,6 +16,15 @@ KEYS_NAMES = {"BACK", "BLUE", "CHANNELDOWN", "CHANNELUP", "DOWN", "ENTER", "EXIT
               "XDG_RUNTIME_DIR", "UUID", "TV", "STB", "LG", "SSDP", "HDMI_3", "API",
               "URL", "JSON", "CPU", "MAC", "IP", "HDMI", "SSAP", "ID",
               "STB_DNS", "STB_GW", "STB_TV_IF_ADDR"}
+
+
+
+def test_commands_doc_is_fresh():
+    generated = subprocess.run([str(ROOT / "bin/stb"), "help", "--markdown"],
+                               capture_output=True, text=True, timeout=30).stdout
+    saved = (ROOT / "docs/COMMANDS.md").read_text(encoding="utf-8")
+    assert generated.strip() == saved.strip(), (
+        "docs/COMMANDS.md устарел — пересоберите: stb help --markdown > docs/COMMANDS.md")
 
 
 def docs():

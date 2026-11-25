@@ -12,3 +12,6 @@
 :root:has(#tabbrowser-tabs .tabbrowser-tab:only-of-type) #navigator-toolbox {
   border-bottom: none !important;
 }
+
+/* Подсказка адреса внизу — лишняя на телевизоре. */
+#statuspanel { display: none !important; }

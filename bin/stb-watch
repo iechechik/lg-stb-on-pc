@@ -75,6 +75,7 @@ SSH_IDLE_LIMIT = int(stbconf.get("SSH_IDLE_LIMIT", "900") or 900)
 DAEMON_SOCK = os.environ.get("STB_TV_SOCK", "/run/stb/tv.sock")
 
 _last_state = None
+_last_confirmed = ""     # последнее непустое состояние от телевизора
 _net_misses = 0
 _last_on = None
 
@@ -144,6 +145,7 @@ def tv_is_on():
     global _last_state, _last_on, _net_misses  # pylint: disable=global-statement
     # Сначала пинг (1 с). Если телевизор ушёл из сети, спрашивать SSAP
     # бессмысленно: ожидание ответа демона — 6 с на каждый опрос.
+    was_offline = _net_misses >= 2      # до этого опроса телевизора не было в сети
     online = tv_in_network()
     if online:
         state, age = power_state()
@@ -154,14 +156,21 @@ def tv_is_on():
     else:
         _net_misses += 1
 
-    if online and not state and _last_on is None:
-        # Телевизор отвечает, но о питании ещё ни разу не спросили. Решать по
-        # этому «выключен» нельзя: на старте сторож гасил экран включённого
-        # телевизора. Возвращаем «не знаю» — смотреть нечего, ждём ответа.
-        if _last_state != "начало":
-            log("tv", "телевизор в сети, состояние ещё не получено — экран не трогаю")
-            _last_state = "начало"
-        return None
+    if online and not state:
+        # Молчание SSAP при телевизоре, который отвечает в сети, — это сбой
+        # связи, а не включение. Быстрый подъём интерфейса оставляем только для
+        # настоящего пробуждения: до этого телевизора не было в сети, и мы
+        # считали его выключенным. Иначе наша сетка вылезала поверх открытого
+        # приложения — «поводил указателем и вылетел в сетку».
+        asleep = _last_confirmed in ("Standby", "Screen Off", "Suspend", "Active Standby")
+        if asleep and was_offline:
+            if _last_state != "пробуждение":
+                log("tv", "телевизор появился в сети — поднимаю интерфейс, не жду состояния")
+                _last_state = "пробуждение"
+            _net_misses = 0
+            _last_on = True
+            return True
+        return bool(_last_on)
 
     on = decide(state, age, online, _last_on, _net_misses)
 
@@ -178,6 +187,10 @@ def tv_is_on():
     elif state != _last_state:
         log("tv", "состояние телевизора: %s" % state)
         _last_state = state
+    if state:
+        # Пустое состояние — это молчание связи, оно не должно затирать память:
+        # иначе любой сбой пинга выглядит как «телевизор проснулся».
+        globals()["_last_confirmed"] = state
     _last_on = on
     return _last_on
 
@@ -243,6 +256,11 @@ def switch_to_stb_input():
     """Телевизор включился — вывести на вход приставки."""
     if not (INPUT_ON_WAKE and TV_INPUT) or current_mode() != "nuc":
         return
+    try:
+        if jelly_has_window():
+            return    # на экране наше приложение: вход не сбиваем
+    except Exception:  # noqa: BLE001
+        pass
     try:
         subprocess.run(["/opt/stb/bin/tv", "setinput", TV_INPUT], capture_output=True,
                        timeout=20,
@@ -364,9 +382,21 @@ def watch_tv():
             time.sleep(CHECK_EVERY)
             continue
 
-        if known is None or cur != known:
+        if known is None:
+            # Первый опрос после запуска: состояние только что узнали, но это не
+            # событие включения. Ничего не переключаю — иначе каждый перезапуск
+            # сторожа поднимал сетку поверх открытого приложения и сбивал вход.
+            known = cur
+            same = 0
+            off_since = None if cur else time.time()
+            log("tv", "старт: телевизор %s — экран и вход не трогаю"
+                % ("включён" if cur else "выключен"))
+        elif cur != known:
             same += 1
-            if known is None or same >= NEED_CONFIRM:
+            # Включение применяем сразу: поднять интерфейс дёшево и обратимо, а
+            # ожидание второго подтверждения добавляло 4–8 секунд к включению.
+            # Для «выключен» подтверждение остаётся — там ошибка гасит картинку.
+            if known is None or same >= NEED_CONFIRM or (cur and known is False):
                 known = cur
                 same = 0
                 log("tv", "телевизор %s → интерфейс %s"
@@ -396,7 +426,9 @@ def watch_tv():
                 warned = True
                 log("tv", "приставка выключится через %d с" % int(left))
 
-        time.sleep(CHECK_EVERY)
+        # Пока телевизор выключен, проверяем чаще: включение должно ловиться
+        # сразу, а пинг — дешёвая проверка (1 с). Включённый опрашиваем как раньше.
+        time.sleep(1 if not cur else CHECK_EVERY)
 
 
 # ═══════════════════════════════════════════════════════════ звук

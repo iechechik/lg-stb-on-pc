@@ -124,13 +124,15 @@ def mode():
 
 
 def on_grid():
-    """Открыта ли наша сетка (по заголовку активного окна)."""
+    """Открыта ли наша сетка: по заголовку активного окна.
+
+    Окружение X собирается один раз (XENV) — раньше его повторяли в каждом
+    вызове xdotool.
+    """
     try:
         r = subprocess.run(["xdotool", "getactivewindow", "getwindowname"],
-                           capture_output=True, timeout=5,
-                           env={**os.environ, "DISPLAY": ":0", "HOME": STB_HOME,
-                                "XAUTHORITY": f"{STB_HOME}/.Xauthority"})
-        return "Приставка" in r.stdout.decode("utf-8", "replace")
+                           capture_output=True, timeout=5, env=XENV)
+        return GRID_TITLE in r.stdout.decode("utf-8", "replace")
     except Exception:  # noqa: BLE001
         return False
 
@@ -149,6 +151,9 @@ def run(cmd):
         w(f"    не смог выполнить {cmd[0]}: {exc}")
 
 
+GRID_TITLE = "Приставка"
+XENV = {**os.environ, "DISPLAY": ":0", "HOME": STB_HOME,
+        "XAUTHORITY": os.path.join(STB_HOME, ".Xauthority")}
 ASYNC_ENV = {**os.environ, "DISPLAY": ":0", "HOME": STB_HOME,
              "XAUTHORITY": os.path.join(STB_HOME, ".Xauthority")}
 
@@ -285,7 +290,8 @@ LAST_CLICK = [0.0]
 X11 = open_pointer()   # указатель на самом экране (XTest); None — тогда xdotool
 TV_DAEMON_OBJ = TV_DAEMON
 PTR = Pointer(run=arun, mode=mode, tv=TV_DAEMON_OBJ, x11=X11, log=w,
-              send_hz=SEND_HZ, click_gap=CLICK_GAP, on_grid=on_grid)
+              send_hz=SEND_HZ, click_gap=CLICK_GAP, on_grid=on_grid,
+              speed=float(stbconf.get("POINTER_SPEED", "0.35") or 0.35))
 TEXT = TextBuffer(run=arun, mode=mode, log=w)      # буфер текста с телефона
 BACK_PENDING = [None]
 BACK_GATE = BackGate(dup_gap=float(stbconf.get("BACK_DUP_GAP", "0.12")))
@@ -447,6 +453,11 @@ async def handle(reader, writer):
         text = payload.decode("utf-8", "replace")
         if not text.strip():
             continue
+
+        # Сырой журнал любого сообщения: нужен, чтобы видеть, что именно
+        # присылает приложение на тап (клик, кнопку или и то и другое).
+        if RAW_LOG:
+            w("RAW: " + text.replace(chr(10), " | ")[:200])
 
         # ---- события указателя
         if text.startswith("type:move"):

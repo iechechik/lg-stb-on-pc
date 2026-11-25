@@ -132,5 +132,15 @@
     "img": "icons/keyboard.png",
     "type": "url",
     "target": "http://127.0.0.1:8090/buttons"
+  },
+  {
+    "id": "ui-restart",
+    "label": "Перезапуск интерфейса",
+    "sub": "браузер заново, чистая сетка",
+    "icon": "🔄",
+    "img": "icons/power-off.png",
+    "type": "command",
+    "target": "/opt/stb/bin/stb ui restart",
+    "confirm": true
   }
 ]

@@ -23,3 +23,4 @@ user_pref("toolkit.legacyUserProfileCustomizations.stylesheets", true);
 user_pref("browser.cache.disk.smart_size.enabled", false);
 user_pref("browser.cache.disk.capacity", 262144);   // 256 МБ
 user_pref("browser.cache.memory.capacity", 65536);  // 64 МБ
+user_pref("browser.startup.page", 1);

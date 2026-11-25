@@ -79,11 +79,14 @@
 
 <script>
 const statusEl = document.getElementById('status');
-function status(msg) {
+function status(msg, sticky) {
   statusEl.textContent = msg;
   statusEl.classList.add('show');
   clearTimeout(statusEl._t);
-  statusEl._t = setTimeout(() => statusEl.classList.remove('show'), 4000);
+  // sticky — сообщение висит, пока не придёт ответ: запуск плеера занимает до
+  // 20 секунд, а раньше надпись исчезала через 4 и казалось, что нажатие
+  // не сработало.
+  if (!sticky) statusEl._t = setTimeout(() => statusEl.classList.remove('show'), 4000);
 }
 function tick() {
   const d = new Date(), p = n => String(n).padStart(2, '0');
@@ -92,7 +95,7 @@ function tick() {
 setInterval(tick, 5000); tick();
 
 function runTile(b) {
-  status(b.label + '…');
+  status(b.label + ': запускаю…', true);
   fetch('/run/' + encodeURIComponent(b.id))
     .then(r => r.json())
     .then(j => status(b.label + (j.ok ? ': ' + (j.msg || 'запущено') : ' — ошибка: ' + j.msg)))
@@ -116,6 +119,10 @@ fetch('/api/buttons').then(r => r.json()).then(list => {
     a.innerHTML = '<div class="ico">' + ico + '</div>' +
                   '<div class="lbl">' + b.label + '</div>' +
                   (b.sub ? '<div class="sub">' + b.sub + '</div>' : '');
+    if (b.type === 'url') {
+      // Сетка глушит звук; сайт в новой вкладке должен играть.
+      a.addEventListener('click', () => { fetch('/sound/on').catch(() => {}); });
+    }
     if (b.type === 'command') {
       a.addEventListener('click', ev => {
         ev.preventDefault();

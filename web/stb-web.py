@@ -290,6 +290,12 @@ class Handler(BaseHTTPRequestHandler):
                                  or b.get("show", True)])
             except Exception as e:  # noqa: BLE001
                 self._json(500, {"ok": False, "msg": str(e)})
+        elif path == "/sound/on":
+            # Плитки-сайты открываются ссылкой: страница просит включить звук,
+            # прежде чем уйти на YouTube и подобное. Сетка звук глушит.
+            subprocess.run(["/opt/stb/bin/stb", "sound", "on"],
+                           capture_output=True, timeout=10)
+            self._json({"ok": True})
         elif path.startswith("/run/"):
             self._run(path[len("/run/"):].strip("/"))
         elif path.startswith("/icons/"):
