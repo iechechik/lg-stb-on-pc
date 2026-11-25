@@ -51,6 +51,15 @@ async def run(action: str, key: str, value) -> int:
         return fail("телевизор не отвечает: %s" % exc)
 
     try:
+        if action == "power":
+            # Своё короткое соединение мимо демона: нужно, когда демон отдаёт
+            # устаревшее состояние, а спросить больше некого.
+            res = await client.get_power_state()
+            state = (res or {}).get("state") if isinstance(res, dict) else ""
+            if not state:
+                return fail("состояние питания не получено: %r" % (res,))
+            print(state)
+            return 0
         if action == "get":
             last = None
             for cat in CATEGORIES:
@@ -93,8 +102,15 @@ async def run(action: str, key: str, value) -> int:
 
 
 def main() -> int:
+    if len(sys.argv) < 2:
+        print("usage: tv-setting get KEY | tv-setting set KEY VALUE | tv-setting power",
+              file=sys.stderr)
+        return 2
+    if sys.argv[1] == "power":
+        return asyncio.run(run("power", "", None))
     if len(sys.argv) < 3:
-        print("usage: tv-setting get KEY | tv-setting set KEY VALUE", file=sys.stderr)
+        print("usage: tv-setting get KEY | tv-setting set KEY VALUE | tv-setting power",
+              file=sys.stderr)
         return 2
     action, key = sys.argv[1], sys.argv[2]
     if action == "get":

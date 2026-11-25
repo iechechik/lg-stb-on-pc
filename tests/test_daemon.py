@@ -2,6 +2,7 @@
 import asyncio
 import importlib.machinery
 import importlib.util
+import io
 import os
 import time
 
@@ -253,14 +254,20 @@ def wifi():
 
 # --------------------------------------------------------------- отказ связи
 class HangingClose:
-    """Клиент, у которого close() не завершается."""
+    """Клиент, у которого disconnect() не завершается."""
 
     def __init__(self):
-        self.close_started = False
+        self.disconnect_started = False
+
+    def is_connected(self):
+        return True
+
+    async def disconnect(self):
+        self.disconnect_started = True
+        await asyncio.sleep(30)
 
     async def close(self):
-        self.close_started = True
-        await asyncio.sleep(30)
+        raise AssertionError("close() — это media.viewer/close, а не закрытие связи")
 
 
 def test_drop_forgets_client_before_closing(link):
@@ -271,7 +278,7 @@ def test_drop_forgets_client_before_closing(link):
     asyncio.run(link.safe_drop())
     spent = time.monotonic() - started
     assert link._client is None, "демон остался со старым клиентом"
-    assert client.close_started is True
+    assert client.disconnect_started is True
     assert spent < link.DROP_TIMEOUT + 0.5
 
 
@@ -281,14 +288,20 @@ class HangingConnect:
     instances = []
 
     def __init__(self):
-        self.closed = False
+        self.disconnected = False
         HangingConnect.instances.append(self)
+
+    def is_connected(self):
+        return False
 
     async def connect(self):
         await asyncio.sleep(30)
 
+    async def disconnect(self):
+        self.disconnected = True
+
     async def close(self):
-        self.closed = True
+        raise AssertionError("close() — это media.viewer/close, а не закрытие связи")
 
 
 async def _fake_create(*args, **kwargs):
@@ -310,7 +323,7 @@ def test_cancelled_connect_closes_client(link, monkeypatch):
     asyncio.run(scenario())
     assert link._client is None
     assert HangingConnect.instances, "клиент не создавался"
-    assert all(c.closed for c in HangingConnect.instances), "сокет остался открытым"
+    assert all(c.disconnected for c in HangingConnect.instances), "сокет остался открытым"
 
 
 def test_expired_budget_refuses_without_waiting(link, monkeypatch):
@@ -532,3 +545,35 @@ def test_wifi_imports_without_keymap(tmp_path, monkeypatch):
     loader.exec_module(module)
     assert module.KEYS == {}
     assert conf.read_text(encoding="utf-8") == original, "импорт переписал конфиг"
+
+
+# ------------------------------------------------ диспетчер кнопок в приёмнике
+def test_keys_run_in_process(wifi):
+    """Диспетчер загружен: иначе каждая кнопка запускает python отдельно."""
+    assert hasattr(wifi, "press_in_process")
+    assert wifi.STBCLI is not None, "bin/stb не загрузился как модуль"
+    assert callable(wifi.STBCLI.cmd_key)
+
+
+def _dispatch_block():
+    src = io.open(os.path.join(ROOT, "bin/stb-wifi-remote"), encoding="utf-8").read()
+    start = src.index("async def press_in_process(")
+    end = src.find("\n# ---- диспетчер", start + 10)
+    return src, src[start:] if end == -1 else src[start:end]
+
+
+def test_subprocess_is_only_a_fallback():
+    """Отдельный процесс остаётся один — если модуль не загрузился."""
+    src, block = _dispatch_block()
+    # Два запуска остаются только как запасные пути: демон не запущен и модуль
+    # не загрузился. Обычный путь идёт через свой процесс.
+    assert src.count('arun(["/opt/stb/bin/stb", "key", act])') == 2
+    assert 'await press_in_process(act)' in src
+    assert "asyncio.to_thread" in block, "вызов уходит в поток, цикл не блокируется"
+    assert "DISPATCH_LOCK" in block, "кнопки не должны выполняться параллельно"
+
+
+def test_key_failure_is_not_retried():
+    """Повтор нажатия при сбое дал бы двойное срабатывание."""
+    _, block = _dispatch_block()
+    assert "повторять не буду" in block

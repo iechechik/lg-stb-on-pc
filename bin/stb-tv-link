@@ -74,10 +74,10 @@ async def connect():
         # отдельной задачей: в отменённой корутине ждать уже нельзя.
         close_later(client)
         raise
-    # Подписки на этой модели не работают (каждый вызов падал и оставлял
-    # полуоткрытый сокет), а у LG число подключений ограничено — приставка
-    # вытесняла Home Assistant. Состояние берём опросом: сторож спрашивает
-    # его каждые 4 секунды, этого достаточно.
+    # Подписок не запрашиваем (states=[]): состояние берём опросом, сторож
+    # спрашивает его каждые несколько секунд, и этого хватает. Так у телевизора
+    # одно соединение, а не одно на подписку: у LG число подключений ограничено,
+    # и лишние вытесняли Home Assistant.
     _client = client
     log("соединение с телевизором установлено")
     return client
@@ -90,7 +90,10 @@ async def drop():
     client, _client = _client, None
     if client is not None:
         try:
-            await client.close()
+            # close() у bscpylgtv — это медиакоманда media.viewer/close: она
+            # закрывает плеер на телевизоре, а сокет оставляет жить. Соединение
+            # рвёт disconnect(): отменяет задачу подключения и закрывает сокеты.
+            await client.disconnect()
         except Exception:  # noqa: BLE001
             pass
 
@@ -108,7 +111,7 @@ _CLOSING = set()
 
 async def _close_quiet(client):
     try:
-        await asyncio.wait_for(client.close(), timeout=DROP_TIMEOUT)
+        await asyncio.wait_for(client.disconnect(), timeout=DROP_TIMEOUT)
     except Exception:  # noqa: BLE001
         pass
 
@@ -124,7 +127,7 @@ def close_later(client):
 
 
 async def ensure():
-    if _client is None:
+    if _client is None or not _client.is_connected():
         try:
             return await connect()
         except Exception as exc:  # noqa: BLE001
@@ -372,7 +375,7 @@ async def refresh_sound():
         _lock.release()
         if dropped is not None:
             try:
-                await asyncio.wait_for(dropped.close(), timeout=DROP_TIMEOUT)
+                await asyncio.wait_for(dropped.disconnect(), timeout=DROP_TIMEOUT)
             except Exception:  # noqa: BLE001
                 pass
 

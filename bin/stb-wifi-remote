@@ -261,7 +261,7 @@ async def do_action(name):
             stbkeys.log_line(act + " (не принято)")
             return
 
-    await arun(["/opt/stb/bin/stb", "key", act])
+    await press_in_process(act)
     w(f"    кнопка {name} -> {act}")
 
 
@@ -273,6 +273,64 @@ from stbws import forget_ws_reader, ws_accept, ws_frame, read_ws_message  # noqa
 from stbtext import TextBuffer  # noqa: E402
 from stbpointer import Pointer  # noqa: E402
 import stbkeys  # noqa: E402
+
+
+# ---- диспетчер кнопок в своём процессе
+# Раньше каждое нажатие запускало `stb key …` отдельным процессом: полсекунды на
+# запуск Python и разбор большого файла. Теперь тот же код загружается один раз
+# при старте приёмника, а вызывается в потоке, чтобы не держать цикл событий.
+def _load_cli():
+    """bin/stb как модуль: смысл кнопок остаётся в одном месте."""
+    import importlib.machinery
+    import importlib.util
+    path = "/opt/stb/bin/stb"
+    loader = importlib.machinery.SourceFileLoader("stbcli", path)
+    spec = importlib.util.spec_from_loader("stbcli", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    return module
+
+
+try:
+    STBCLI = _load_cli()
+except Exception as exc:  # noqa: BLE001
+    STBCLI = None
+    w(f"диспетчер кнопок не загрузился ({exc}) — зову stb key отдельным процессом")
+
+
+def _call_key(act):
+    try:
+        return STBCLI.cmd_key([act])
+    except SystemExit as exc:            # cmd_key так сообщает об ошибке ввода
+        return exc.code
+    except Exception as exc:  # noqa: BLE001
+        w(f"    {act}: ошибка в своём процессе ({exc})")
+        return 1
+
+
+DISPATCH_LOCK = None
+
+
+async def press_in_process(act):
+    """Кнопка считается в этом процессе; поток — чтобы не блокировать приём.
+
+    Повторов нет намеренно: нажатие не идемпотентно (громкость, Back), и второй
+    запуск после сбоя дал бы двойное срабатывание.
+    """
+    global DISPATCH_LOCK  # pylint: disable=global-statement
+    if STBCLI is None:
+        await arun(["/opt/stb/bin/stb", "key", act])
+        return
+    if DISPATCH_LOCK is None:
+        DISPATCH_LOCK = asyncio.Lock()
+    async with DISPATCH_LOCK:
+        started = time.monotonic()
+        code = await asyncio.to_thread(_call_key, act)
+        spent = time.monotonic() - started
+    if code not in (0, None):
+        w(f"    {act}: свой процесс вернул {code} — повторять не буду")
+    elif spent > 0.5:
+        w(f"    {act}: {spent:.2f} с")
 
 # ---- настройки и состояние приёмника
 # В сетке двойной клик тап-пада приходит двумя кликами и открывает плитку дважды.
@@ -542,6 +600,9 @@ async def handle(reader, writer):
             await writer.drain()
         elif "ime/sendEnterKey" in uri:
             TEXT.flush()
+            # Следующий текст — с чистого листа: иначе тот же запрос после Enter
+            # считался повтором предыдущего куска и молча пропускался.
+            TEXT.reset()
             if mode() == "tv":
                 await arun(["/opt/stb/bin/stb", "tv", "text", "--enter"])
             else:
@@ -552,7 +613,7 @@ async def handle(reader, writer):
         elif "ime/deleteCharacters" in uri:
             count = (req.get("payload") or {}).get("count", 1) or 1
             TEXT.flush()
-            TEXT.last = ""
+            TEXT.reset()
             if mode() == "tv":
                 await arun(["/opt/stb/bin/stb", "tv", "text", "--delete", str(int(count))])
             else:

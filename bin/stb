@@ -734,7 +734,9 @@ def cmd_tv_text(argv):
                 await asyncio.wait_for(client.request(
                     "luna://com.webos.service.ime/sendEnterKey", {"text": ""}), 10)
         finally:
-            await client.close()
+            # disconnect(), а не close(): close() — это медиакоманда и
+            # закрывала плеер на телевизоре вместо соединения.
+            await client.disconnect()
 
     try:
         asyncio.run(send())

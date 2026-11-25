@@ -38,19 +38,23 @@ def test_delete_without_count_rejected(tvtext):
 
 
 class Harness:
-    """Буфер с перехваченными вызовами вместо xdotool."""
+    """Буфер с перехваченными вызовами вместо xdotool и ручными часами."""
 
     def __init__(self, mode="nuc"):
         self.calls = []
-        self.buf = TextBuffer(delay=0, run=self._run, mode=lambda: mode)
+        self.logs = []
+        self.now = 100.0
+        self.buf = TextBuffer(delay=0, run=self._run, mode=lambda: mode,
+                              clock=lambda: self.now, log=self.logs.append)
 
     async def _run(self, cmd, timeout=25):
         self.calls.append(list(cmd))
         return True
 
-    def feed_all(self, texts):
+    def feed_all(self, texts, gap=0.2):
         async def scenario():
             for text in texts:
+                self.now += gap
                 self.buf.feed(text)
             if self.buf.task:
                 self.buf.task.cancel()
@@ -94,3 +98,43 @@ def test_tv_mode_goes_through_tv_text():
     assert any(("tv-text" in " ".join(c))
                or ("stb" in " ".join(c) and "text" in " ".join(c))
                for c in h.calls), h.calls
+
+
+def test_repeated_letter_is_typed():
+    """Ручной набор «ссс» больше не превращается в «с»."""
+    h = Harness()
+    h.feed_all(["с", "с", "с"], gap=0.2)
+    assert h.typed() == ["ссс"]
+
+
+def test_physical_duplicate_of_one_letter_glued():
+    """Пара событий на одно нажатие (0,02 с) — один символ."""
+    h = Harness()
+    h.feed_all(["с", "с"], gap=0.02)
+    assert h.typed() == ["с"]
+
+
+def test_request_after_enter_is_not_skipped():
+    """Тот же запрос после Enter уходит снова."""
+    h = Harness()
+
+    async def scenario():
+        h.now += 0.2
+        h.buf.feed("сериал")
+        await h.buf.flush()
+        h.buf.reset()          # Enter сбрасывает буфер
+        h.now += 5.0
+        h.buf.feed("сериал")
+        await h.buf.flush()
+
+    asyncio.run(scenario())
+    assert h.typed() == ["сериал", "сериал"]
+
+
+def test_duplicate_skip_is_logged_with_text_and_gap():
+    """По журналу видно, что пропущено и с каким зазором."""
+    h = Harness()
+    h.feed_all(["молоко", "молоко"], gap=0.05)
+    joined = " | ".join(h.logs)
+    assert "пропуск 'молоко'" in joined, joined
+    assert "0.05 с" in joined, joined

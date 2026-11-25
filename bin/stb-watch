@@ -61,6 +61,10 @@ STB_HOME = stbconf.get("STB_HOME", "/home/stbuser")
 TV = stbconf.get("TV_IP", "")
 TV_INPUT = stbconf.get("TV_INPUT_ID", "")
 INPUT_ON_WAKE = str(stbconf.get("TV_INPUT_ON_WAKE", "0")).strip() in ("1", "yes", "true")
+# Сколько секунд терпеть «телевизор в сети, а SSAP молчит», прежде чем
+# спросить питание своим соединением мимо демона.
+UNKNOWN_LIMIT = float(stbconf.get("TV_UNKNOWN_LIMIT", "180") or 180)
+_unknown_since = None
 CHECK_EVERY = 4
 # Срок запроса к демону — как у остальных клиентов (8 с): демон тратит на
 # команду до 6 с, и короткий срок сторожа заставлял бы его сдаваться раньше
@@ -125,6 +129,21 @@ def tv_in_network():
         return False
 
 
+def ask_power_direct():
+    """Состояние питания своим соединением, мимо демона; пусто — не спросилось."""
+    try:
+        out = subprocess.run(
+            ["sudo", "-n", "-u", "stbuser", "env", "HOME=/home/stbuser",
+             "/usr/bin/python3", "/opt/stb/lib/tv_setting.py", "power"],
+            capture_output=True, text=True, timeout=12)
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    lines = [ln.strip() for ln in (out.stdout or "").splitlines() if ln.strip()]
+    if not lines or "ERROR" in lines[-1]:
+        return ""
+    return lines[-1]
+
+
 def decide(state, age, online, last_on, misses):
     """Что считать: включён ли телевизор.
 
@@ -159,6 +178,23 @@ def tv_is_on():
         _net_misses = 0
     else:
         _net_misses += 1
+
+    # Долгое молчание SSAP при живом пинге: демон отдаёт устаревшее состояние,
+    # и «включён» держалось бы вечно. Через UNKNOWN_LIMIT спрашиваем питание сами.
+    global _unknown_since  # pylint: disable=global-statement
+    if online and not state:
+        now = time.monotonic()
+        if _unknown_since is None:
+            _unknown_since = now
+        elif now - _unknown_since >= UNKNOWN_LIMIT:
+            asked = ask_power_direct()
+            _unknown_since = now
+            if asked:
+                log("tv", "демон молчит %.0f с — спросил питание напрямую: %s"
+                    % (UNKNOWN_LIMIT, asked))
+                state, age = asked, 0.0
+    else:
+        _unknown_since = None
 
     if online and not state:
         # Молчание SSAP при телевизоре, который отвечает в сети, — это сбой
