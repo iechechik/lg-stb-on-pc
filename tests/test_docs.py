@@ -9,6 +9,11 @@ import subprocess
 ROOT = pathlib.Path(os.environ.get("STB_ROOT", "/opt/stb"))
 CFG = io.open(os.path.join(str(ROOT), "config/stb.conf"), encoding="utf-8").read()
 KEYS = set(re.findall(r"^([A-Z][A-Z0-9_]+)=", CFG, re.M))
+# переменные, которые читает только установщик: в stb.conf их нет
+INSTALL_VARS = set(re.findall(
+    r"\b(STB_[A-Z0-9_]+)\b",
+    io.open(os.path.join(str(ROOT), "install.sh"), encoding="utf-8").read()))
+
 KEYS_NAMES = {"BACK", "BLUE", "CHANNELDOWN", "CHANNELUP", "DOWN", "ENTER", "EXIT",
               "FASTFORWARD", "GREEN", "GUIDE", "INFO", "LEFT", "MENU", "MUTE",
               "PAUSE", "PLAY", "RED", "REWIND", "RIGHT", "SUBTITLE", "VOLUMEDOWN",
@@ -81,7 +86,7 @@ def test_docs_match_system():
                 problems.append("%s: команда stb %s" % (os.path.basename(doc), topic))
 
         for key in set(re.findall(r"`([A-Z][A-Z0-9_]{2,})`", text)):
-            if key not in KEYS and key not in KEYS_NAMES:
+            if key not in KEYS and key not in KEYS_NAMES and key not in INSTALL_VARS:
                 problems.append("%s: параметр %s" % (os.path.basename(doc), key))
 
         for log in set(re.findall(r"/var/log/stb/([\w.-]+\.log)", text)):

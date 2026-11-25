@@ -29,8 +29,10 @@ if [ "${1:-}" = "--check" ]; then
     echo "== проверка архива (ничего не меняем) =="
     problems=0
     need="bin/stb bin/stb-watch bin/stb-wifi-remote bin/stb-tv-link \
-lib/stbtv.py lib/stbback.py lib/stbx11.py lib/stbconf.sh \
+lib/stbtv.py lib/stbgesture.py lib/stbtvlast.py lib/stbx11.py lib/stbconf.py lib/stbconf.sh \
+lib/stbkeys.py lib/stbpointer.py lib/stbtext.py lib/stbws.py lib/tv_setting.py \
 web/index.html web/stb-web.py config/stb.conf config/tiles.json \
+README.md tests/run_tests.sh tests/test_docs.py \
 system/etc/systemd/system/stb.target \
 system/etc/dnsmasq.d/tv-lan.conf.template \
 system/etc/network/interfaces.d/tv-lan.template \
@@ -204,7 +206,7 @@ if [ "$SRC" != "$DST" ]; then
         install -d "$DST/$d"
         cp -a "$SRC/$d/." "$DST/$d/"
     done
-    for f in install.sh makedist.sh setup.cfg; do
+    for f in install.sh makedist.sh setup.cfg README.md; do
         [ -e "$SRC/$f" ] && cp -a "$SRC/$f" "$DST/" && chmod 755 "$DST/$f"
     done
     ok "дерево скопировано в $DST"
@@ -212,7 +214,7 @@ else
     ok "установка из самого $DST — копировать нечего"
 fi
 chmod 755 "$DST"/bin/*
-chown -R "$STB_USER:$STB_USER" "$DST/web" "$DST/config"
+chown -R "$STB_USER:$STB_USER" "$DST"
 chmod 644 "$DST"/web/*.html "$DST"/web/*.py
 ln -sfn "$DST/bin/stb" /usr/local/bin/tv
 ok "ссылка /usr/local/bin/tv"

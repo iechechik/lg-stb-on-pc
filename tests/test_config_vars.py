@@ -1,8 +1,9 @@
 """Согласованность кода и конфига: все переменные из кода есть в stb.conf."""
+import os
 import pathlib
 import re
 
-ROOT = pathlib.Path("/opt/stb")
+ROOT = pathlib.Path(os.environ.get("STB_ROOT", "/opt/stb"))
 
 # переменные, которые задаются извне и в конфиге не нужны
 ALLOWED = {"STB_CONFIG", "STB_CONFIG_DIR", "STB_ROOT", "STB_TV_SOCK"}

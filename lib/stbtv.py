@@ -30,26 +30,45 @@ class TvDaemon:
     def ask(self, req, timeout=DEFAULT_TIMEOUT):
         """Запрос к демону.
 
-        `transport: True` в ответе значит «до демона не достучались» — только
-        тогда имеет смысл прямое подключение к телевизору. Ответ демона с
-        `ok: False` без этого признака — отказ телевизора, повторять нельзя.
+        Ответ с `ok: False` и без признака `transport` — отказ телевизора,
+        повторять нельзя. `transport: True` значит «до демона не достучались»,
+        и вместе с ним идёт `sent`:
+
+          * `sent: False` — соединения не было, запрос точно не ушёл;
+          * `sent: True` — запрос мог дойти до телевизора, судьба неизвестна
+            (тогда же стоит `unknown: True`), повторять нельзя.
+
+        Разница принципиальная: громкость и Back не идемпотентны, и повтор
+        после неизвестного исхода даёт двойное срабатывание.
         """
+        deadline = time.monotonic() + timeout
         s = None
+        sent = False
         try:
             s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
-            s.settimeout(timeout)
+            s.settimeout(max(0.05, deadline - time.monotonic()))
             s.connect(self.path)
             s.sendall((json.dumps(req, ensure_ascii=False) + "\n").encode("utf-8"))
+            sent = True
             data = b""
             while not data.endswith(b"\n"):
+                rest = deadline - time.monotonic()
+                if rest <= 0:
+                    raise socket.timeout("срок ответа вышел")
+                s.settimeout(rest)
                 chunk = s.recv(65536)
                 if not chunk:
                     break
                 data += chunk
-            return json.loads(data.decode("utf-8", "replace") or "{}")
+            if not data.strip():
+                raise ConnectionError("демон закрыл соединение без ответа")
+            return json.loads(data.decode("utf-8", "replace"))
         except (OSError, ValueError) as exc:
-            return {"ok": False, "transport": True,
-                    "msg": "демон не ответил (%s)" % type(exc).__name__}
+            answer = {"ok": False, "transport": True, "sent": sent,
+                      "msg": "демон не ответил (%s)" % type(exc).__name__}
+            if sent:
+                answer["unknown"] = True
+            return answer
         finally:
             if s is not None:
                 try:
@@ -65,25 +84,44 @@ class TvDaemon:
 
     # ------------------------------------------------------------ асинхронно
     async def aask(self, req, timeout=DEFAULT_TIMEOUT):
-        """Асинхронный запрос: один срок на всё — соединение, отправку и ответ."""
+        """Асинхронный запрос: один срок на всё — соединение, отправку и ответ.
+
+        Признак `sent` считается так же, как в `ask()`: после записи в сокет
+        исход уже неизвестен, и повторять команду нельзя.
+        """
         deadline = time.monotonic() + timeout
         writer = None
+        sent = False
+
+        def left():
+            return deadline - time.monotonic()
+
+        async def bounded(coro):
+            rest = left()
+            if rest <= 0:
+                raise asyncio.TimeoutError("срок ответа вышел")
+            return await asyncio.wait_for(coro, timeout=rest)
+
         try:
-            left = max(0.1, deadline - time.monotonic())
-            reader, writer = await asyncio.wait_for(
-                asyncio.open_unix_connection(self.path), timeout=left)
+            reader, writer = await bounded(asyncio.open_unix_connection(self.path))
             writer.write((json.dumps(req, ensure_ascii=False) + "\n").encode("utf-8"))
-            await asyncio.wait_for(writer.drain(), timeout=max(0.1, deadline - time.monotonic()))
-            line = await asyncio.wait_for(reader.readline(),
-                                          timeout=max(0.1, deadline - time.monotonic()))
-            return json.loads(line.decode("utf-8", "replace") or "{}")
+            sent = True
+            await bounded(writer.drain())
+            line = await bounded(reader.readline())
+            if not line.strip():
+                raise ConnectionError("демон закрыл соединение без ответа")
+            return json.loads(line.decode("utf-8", "replace"))
         except (OSError, ValueError, asyncio.TimeoutError) as exc:
-            return {"ok": False, "transport": True,
-                    "msg": "демон не ответил (%s)" % type(exc).__name__}
+            answer = {"ok": False, "transport": True, "sent": sent,
+                      "msg": "демон не ответил (%s)" % type(exc).__name__}
+            if sent:
+                answer["unknown"] = True
+            return answer
         finally:
             if writer is not None:
                 try:
                     writer.close()
+                    await asyncio.wait_for(writer.wait_closed(), timeout=0.5)
                 except Exception:  # noqa: BLE001
                     pass
 

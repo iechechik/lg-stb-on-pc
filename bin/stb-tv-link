@@ -47,7 +47,7 @@ STATE = {"power": None, "sound": None, "app": None, "volume": None, "muted": Non
          "app_updated": None}
 _client = None
 _lock = asyncio.Lock()
-DROP_TIMEOUT = 2.0        # закрытие соединения не держит замок дольше
+DROP_TIMEOUT = 1.0        # закрытие не держим дольше: клиент уже отсоединён
 
 
 def log(msg):
@@ -67,7 +67,13 @@ async def connect():
     global _client  # pylint: disable=global-statement
     client = await bscpylgtv.WebOsClient.create(
         TV, key_file_path=KEY, manifest_file_path=MANIFEST, states=[])
-    await client.connect()
+    try:
+        await client.connect()
+    except BaseException:
+        # Соединение ещё никому не отдано, но сокет мог открыться; закрываем
+        # отдельной задачей: в отменённой корутине ждать уже нельзя.
+        close_later(client)
+        raise
     # Подписки на этой модели не работают (каждый вызов падал и оставлял
     # полуоткрытый сокет), а у LG число подключений ограничено — приставка
     # вытесняла Home Assistant. Состояние берём опросом: сторож спрашивает
@@ -79,12 +85,14 @@ async def connect():
 
 async def drop():
     global _client  # pylint: disable=global-statement
-    if _client is not None:
+    # Сначала отказываемся от клиента, потом закрываем: если закрытие
+    # зависнет и его отменит wait_for, ссылка уже не останется старой.
+    client, _client = _client, None
+    if client is not None:
         try:
-            await _client.close()
+            await client.close()
         except Exception:  # noqa: BLE001
             pass
-        _client = None
 
 
 async def safe_drop(timeout=DROP_TIMEOUT):
@@ -93,6 +101,26 @@ async def safe_drop(timeout=DROP_TIMEOUT):
         await asyncio.wait_for(drop(), timeout=timeout)
     except Exception as exc:  # noqa: BLE001
         log("соединение закрывалось дольше %.1f с (%s) — продолжаю" % (timeout, str(exc)[:60]))
+
+
+_CLOSING = set()
+
+
+async def _close_quiet(client):
+    try:
+        await asyncio.wait_for(client.close(), timeout=DROP_TIMEOUT)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+def close_later(client):
+    """Закрыть клиента, за которым уже никто не следит."""
+    try:
+        task = asyncio.create_task(_close_quiet(client))
+    except RuntimeError:          # нет работающего цикла — закрывать нечем
+        return
+    _CLOSING.add(task)
+    task.add_done_callback(_CLOSING.discard)
 
 
 async def ensure():
@@ -113,8 +141,7 @@ PERIODIC_QUERY = 5        # запрос звука в периодическо�
 PERIODIC_LOCK_WAIT = 2    # сколько ждём очереди, прежде чем пропустить тик
 # Бюджеты короче клиентских (8 с в lib/stbtv.py): демон должен успеть сказать
 # «не вышло» раньше, чем клиент решит, что демон мёртв, и полезет напрямую.
-COMMAND_TIMEOUT = 6.0    # секунд на одну команду целиком
-CONNECT_TIMEOUT = 5.0    # секунд на установление соединения
+COMMAND_TIMEOUT = 5.0    # секунд на одну команду целиком (очередь + связь + ответ)
 
 
 def touch():
@@ -256,13 +283,14 @@ async def handle(req):
     cmd = (req or {}).get("cmd", "")
     deadline = time.monotonic() + COMMAND_TIMEOUT
 
-    def left(minimum=0.1):
-        return max(minimum, deadline - time.monotonic())
+    def left():
+        """Сколько осталось от общего срока; ноль и меньше — срок вышел."""
+        return max(0.0, deadline - time.monotonic())
 
     try:
         await asyncio.wait_for(_lock.acquire(), timeout=left())
     except asyncio.TimeoutError:
-        log("команда %s ждала очередь дольше %.0f с" % (cmd, COMMAND_TIMEOUT))
+        log("команда %s не дождалась очереди за %.0f с" % (cmd, COMMAND_TIMEOUT))
         return {"ok": False, "msg": "демон занят другой командой"}
     try:
         try:

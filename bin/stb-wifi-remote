@@ -41,7 +41,7 @@ for _p in _glob.glob(os.path.join(STB_HOME, "tvctl", "lib", "python3*", "site-pa
 
 LAN_IP = os.environ.get("FAKETV_IP") or stbconf.own_ip()
 PORT = int(os.environ.get("FAKETV_PORT") or stbconf.get("WF_PORT", "3000"))
-LOG = "/var/log/stb/faketv.log"
+LOG = os.environ.get("FAKETV_LOG") or "/var/log/stb/faketv.log"
 MODE_FILE = "/run/stb/mode"
 KEY_FILE = f"{STB_HOME}/.aiopylgtv.sqlite"
 MANIFEST = f"{STB_HOME}/tvctl/nuc_manifest.json"
@@ -59,6 +59,13 @@ KNOWN_ST = frozenset({
     "upnp:rootdevice",
 })
 ST_RENDERER = "urn:schemas-upnp-org:device:MediaRenderer:1"
+
+
+def w(msg):
+    # миллисекунды: по этому журналу меряем темп двойных нажатий
+    stamp = time.strftime("%H:%M:%S") + f".{int(time.time() * 1000) % 1000:03d}"
+    with open(LOG, "a", buffering=1, encoding="utf-8") as f:
+        f.write(f"{stamp} {msg}\n")
 
 
 def load_keymap():
@@ -83,13 +90,6 @@ def load_keymap():
 
 
 KEYS = load_keymap()
-
-
-def w(msg):
-    # миллисекунды: по этому журналу меряем темп двойных нажатий
-    stamp = time.strftime("%H:%M:%S") + f".{int(time.time() * 1000) % 1000:03d}"
-    with open(LOG, "a", buffering=1, encoding="utf-8") as f:
-        f.write(f"{stamp} {msg}\n")
 
 
 def ensure_uuid(current):
@@ -185,32 +185,30 @@ async def arun(cmd, timeout=25):
         return False
 
 
-def _wait_seconds():
-    """Сколько держать одиночный Back: пауза и окно двойного — берём большее."""
-    try:
-        hold = float(stbconf.get("BACK_HOLD", "1.0"))
-    except ValueError:
-        hold = 1.0
-    try:
-        double = float(stbconf.get("DOUBLE_BACK", "1.0"))
-    except ValueError:
-        double = 1.0
-    return max(hold, double)
-
-
-def _send_back_later():
-    """Придержать одиночный Back: при двойном нажатии он не должен уйти в ТВ."""
-    timer = threading.Timer(_wait_seconds(), _send_back_now)
+def _hold_single(name, gest):
+    """Придержать одиночное нажатие: уйдёт, если второго не будет."""
+    timer = threading.Timer(gest.window, _fire_single, args=(name,))
     timer.daemon = True
-    BACK_PENDING[0] = timer
+    PENDING[name] = timer
     timer.start()
 
 
-def _send_back_now():
-    BACK_PENDING[0] = None
-    BACK_GATE.fired()
+def _fire_single(name):
+    """Окно прошло: нажатие было одиночным."""
+    PENDING.pop(name, None)
+    gest = GESTURES.get(name)
+    if gest is not None:
+        gest.fired()
     if LOOP[0] is not None:
-        LOOP[0].call_soon_threadsafe(lambda: asyncio.ensure_future(do_action("back")))
+        LOOP[0].call_soon_threadsafe(
+            lambda: asyncio.ensure_future(do_action(name.lower())))
+
+
+def _cancel_single(name):
+    """Двойное нажатие: придержанное одиночное не отправляем."""
+    timer = PENDING.pop(name, None)
+    if timer is not None:
+        timer.cancel()
 
 
 def daemon_alive():
@@ -229,7 +227,8 @@ def should_use_cli(resp):
     Отказ телевизора и молчание живого демона — не повод повторять: клиент уже
     отправил нажатие, и повтор дал бы двойное срабатывание (Back, громкость).
     """
-    return bool(resp.get("transport")) and not daemon_alive()
+    return (bool(resp.get("transport")) and not resp.get("sent")
+            and not daemon_alive())
 
 
 async def do_action(name):
@@ -269,7 +268,7 @@ async def do_action(name):
 # --------------------------------------------------------------- указатель
 TV_DAEMON = TvDaemon()
 from stbx11 import open_pointer  # noqa: E402
-from stbback import BackGate  # noqa: E402
+import stbgesture  # noqa: E402
 from stbws import forget_ws_reader, ws_accept, ws_frame, read_ws_message  # noqa: E402
 from stbtext import TextBuffer  # noqa: E402
 from stbpointer import Pointer  # noqa: E402
@@ -293,9 +292,9 @@ PTR = Pointer(run=arun, mode=mode, tv=TV_DAEMON_OBJ, x11=X11, log=w,
               send_hz=SEND_HZ, click_gap=CLICK_GAP, on_grid=on_grid,
               speed=float(stbconf.get("POINTER_SPEED", "0.35") or 0.35))
 TEXT = TextBuffer(run=arun, mode=mode, log=w)      # буфер текста с телефона
-BACK_PENDING = [None]
-BACK_GATE = BackGate(dup_gap=float(stbconf.get("BACK_DUP_GAP", "0.12")))
-LOOP = [None]   # цикл событий: таймер Back живёт в отдельном потоке
+GESTURES = stbgesture.load(stbconf.get)   # кнопки с выдержкой (сейчас BACK)
+PENDING = {}                              # кнопка → таймер придержанного нажатия
+LOOP = [None]   # цикл событий: таймер придержанного нажатия живёт в потоке
 
 
 # --------------------------------------------------------------- буфер текста
@@ -488,28 +487,19 @@ async def handle(reader, writer):
                 w(f"КНОПКА: {name} (дубль отброшен, {int((_now - _prev) * 1000)} мс)")
                 continue
 
-            if name == "BACK":
-                now = time.monotonic()
-                # приложение шлёт одно нажатие дважды — склеиваем события
-                if BACK_GATE.duplicate(now):
-                    w("КНОПКА: BACK (повтор того же нажима)")
+            if name in GESTURES:
+                gest = GESTURES[name]
+                if gest.duplicate(time.monotonic()):
+                    w(f"КНОПКА: {name} (повтор того же нажима)")
                     continue
-
-                if mode() == "tv":
-                    if BACK_GATE.press() == "tobox":
-                        # второй нажим: возврат на приставку, в телевизор не уходит
-                        if BACK_PENDING[0] is not None:
-                            BACK_PENDING[0].cancel()
-                            BACK_PENDING[0] = None
-                        BACK_GATE.cancel()
-                        w("КНОПКА: BACK ×2 → на приставку (без Back в ТВ)")
-                        await do_action("tobox")
-                    else:
-                        w("КНОПКА: BACK (жду второй)")
-                        _send_back_later()
+                if gest.press() == "double":
+                    _cancel_single(name)
+                    act = stbgesture.double_action(name)
+                    w(f"КНОПКА: {name} ×2 → {act}")
+                    await do_action(act)
                 else:
-                    w("КНОПКА: BACK")
-                    await do_action("back")
+                    w(f"КНОПКА: {name} (придержан, окно {gest.window:.1f} с)")
+                    _hold_single(name, gest)
                 continue
             w(f"КНОПКА: {name}")
             await do_action(name)
@@ -595,7 +585,11 @@ async def handle(reader, writer):
 
 
 async def main():
+    global UUID  # pylint: disable=global-statement
     LOOP[0] = asyncio.get_running_loop()
+    # Идентификатор придумывается при старте, а не при импорте: импорт не должен
+    # писать в живой конфиг (это ломало тесты и меняло UUID у пульта).
+    UUID = ensure_uuid(UUID)
     os.makedirs(os.path.dirname(LOG), exist_ok=True)
     w(f"=== старт {LAN_IP}:{PORT} (режим: {mode()}) ===")
     PTR.start()
@@ -604,8 +598,6 @@ async def main():
     async with server:
         await server.serve_forever()
 
-
-UUID = ensure_uuid(UUID)   # после определения w() и ensure_uuid()
 
 if __name__ == "__main__":
     asyncio.run(main())

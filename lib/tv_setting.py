@@ -1,11 +1,14 @@
 #!/usr/bin/env python3
 """tv-setting — чтение и запись системных настроек телевизора LG.
 
-    tv-setting get autoOff15Min [ключ ...]
-    tv-setting set autoOff15Min off
+    tv-setting get audioGuidance
+    tv-setting set audioGuidance on
 
-Категория настроек — general. Ошибки печатаются одной строкой, без трассировки.
-Параметры подключения берутся из окружения: TV_IP, TV_KEYFILE, TV_MANIFEST.
+Прошивка отдаёт не все ключи: на 49UK6450 работает категория option
+(audioGuidance), а picture/time отвечают «Some keys are not allowed».
+Ошибки печатаются одной строкой, без трассировки.
+Параметры подключения: TV_IP, TV_KEYFILE, TV_MANIFEST — из окружения, а если их
+там нет, из конфига и домашнего каталога пользователя приставки (как в stb-tv-link).
 """
 import asyncio
 import json
@@ -13,6 +16,14 @@ import os
 import sys
 
 import bscpylgtv
+
+import stbconf
+
+STB_HOME = stbconf.get("STB_HOME", "/home/stbuser")
+TV_IP = os.environ.get("TV_IP") or stbconf.get("TV_IP", "")
+TV_KEYFILE = os.environ.get("TV_KEYFILE") or os.path.join(STB_HOME, ".aiopylgtv.sqlite")
+TV_MANIFEST = (os.environ.get("TV_MANIFEST")
+               or os.path.join(STB_HOME, "tvctl/nuc_manifest.json"))
 
 # Ключи живут в разных категориях: autoOff15Min — в time, экранные — в general.
 CATEGORIES = ["time", "general", "option"]
@@ -24,10 +35,12 @@ def fail(message: str, code: int = 1) -> int:
 
 
 async def run(action: str, key: str, value) -> int:
+    if not TV_IP:
+        return fail("не знаю адрес телевизора: задайте TV_IP в stb.conf")
     client = await bscpylgtv.WebOsClient.create(
-        os.environ["TV_IP"],
-        key_file_path=os.environ["TV_KEYFILE"],
-        manifest_file_path=os.environ["TV_MANIFEST"],
+        TV_IP,
+        key_file_path=TV_KEYFILE,
+        manifest_file_path=TV_MANIFEST,
         states=[],
         timeout_connect=2,
         connect_retry_attempts=3,
@@ -56,7 +69,7 @@ async def run(action: str, key: str, value) -> int:
                 if settings and settings.get(key) is not None:
                     print("%s:%s" % (cat, settings[key]))
                     return 0
-            return fail("ключ %s не поддерживается: %s" % (key, last))
+            return fail("ключ %s этот телевизор не отдаёт: %s" % (key, last))
         last = None
         for cat in CATEGORIES:
             try:

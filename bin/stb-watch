@@ -27,6 +27,7 @@ import time
 sys.path.insert(0, "/opt/stb/lib")
 import stbconf  # noqa: E402
 from stbtv import TvDaemon  # noqa: E402
+import stbtvlast  # noqa: E402
 
 LOGS = {
     "tv": "/var/log/stb/tvwatch.log",
@@ -103,6 +104,9 @@ def power_state():
     """
     answer = daemon_ask({"cmd": "state"})
     state = answer.get("state") or {}
+    # Что человек смотрел, кроме нашего входа: отсюда плитка «Телевизор» знает,
+    # куда возвращаться. Пишем только на изменение, опрос идёт каждые секунды.
+    stbtvlast.remember(state.get("app"), stbconf.get)
     # Возраст берём у самого питания: ответ на вопрос о звуке или приложении не
     # делает состояние питания свежим, а сторож решает именно по нему.
     # Только своя отметка питания: `updated` двигается и после команд (mute,

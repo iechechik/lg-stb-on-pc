@@ -31,6 +31,7 @@ import sys
 sys.path.insert(0, "/opt/stb/lib")
 import stbconf  # noqa: E402
 from stbtv import TvDaemon  # noqa: E402
+import stbtvlast  # noqa: E402
 
 STB_HOME = stbconf.get("STB_HOME", "/home/stbuser")
 STB_USER = stbconf.get("STB_USER", "stbuser")
@@ -39,7 +40,6 @@ TV_PORT = stbconf.get("TV_PORT", "3000")
 TV_MAC = stbconf.get("TV_MAC", "")
 TV_IF = stbconf.get("TV_IF", "enp0s25")
 TV_INPUT = stbconf.get("TV_INPUT_ID", "")
-DOUBLE_BACK = float(stbconf.get("DOUBLE_BACK", "1.0") or 1.0)
 TV_APP = stbconf.get("TV_APP_ID", "")
 TV_LIVE = stbconf.get("TV_LIVE_APP", "com.webos.app.livetv")
 TV_SPEAKER = stbconf.get("TV_SPEAKER", "")
@@ -216,7 +216,7 @@ def tv_command(req, *fallback):
     answer = daemon().ask(req)
     if answer.get("ok"):
         return 0
-    if answer.get("transport") and not daemon_alive():
+    if answer.get("transport") and not answer.get("sent") and not daemon_alive():
         need_tv()
         return cli_call(*fallback).returncode
     print(answer.get("msg") or "телевизор не выполнил команду", file=sys.stderr)
@@ -460,11 +460,21 @@ def cmd_live(argv):
         say("live: телевизор не проснулся")
         print("телевизор не проснулся", file=sys.stderr)
         return 1
-    # Источник телевизора не меняем: пусть остаётся тот, что был (эфир, другое
-    # приложение, наш вход). Раньше сюда принудительно ставился эфир.
+    # Свой вход оставлять нельзя: после возврата в сетку источник — наш HDMI,
+    # и «Телевизор» показывал бы ту же сетку. Открываем то, что смотрели
+    # последним (сторож запоминает чужое приложение), иначе запасное.
+    target = ""
+    if str(stbconf.get("TV_RESTORE_LAST", "1")).strip().lower() in ("1", "on", "true", "yes"):
+        target = stbtvlast.last(stbconf.get)
+    if not target:
+        target = str(stbconf.get("TV_FALLBACK_APP", "com.webos.app.home") or "")
+    if target:
+        say("live: открываю %s" % target)
+        cmd_tv(["app", target])
+    else:
+        say("live: источник не меняю")
     mode_set("tv")
     cmd_tv(["speaker-auto"])
-    say("live: режим телевизор")
     print("перехожу на телевизор")
     return 0
 
@@ -827,8 +837,18 @@ def hidden_check():
     env = user_env()
     # Окно могли вернуть мимо плитки (оконный менеджер, alt-tab). Тогда возраст
     # отметки уже ничего не значит: человек смотрит, гасить нельзя.
-    wins = subprocess.run(["xdotool", "search", "--name", title], env=env,
-                          capture_output=True, text=True).stdout.split() if title else []
+    found = (subprocess.run(["xdotool", "search", "--name", title], env=env,
+                            capture_output=True, text=True)
+             if title else None)
+    # xdotool: 0 — окна есть, 1 — нет подходящих, больше — сам не смог
+    # (нет X, сломан DISPLAY). В последнем случае состояние неизвестно:
+    # закрывать приложение нельзя, человек может его смотреть.
+    if found is not None and found.returncode > 1:
+        say("окно (%s) проверить не удалось (xdotool код %d) — приложение оставляю"
+            % (title[:40], found.returncode))
+        return 0
+    wins = found.stdout.split() if found is not None else []
+    unverified = 0
     for wid in wins:
         if not wid.isdigit():
             continue
@@ -838,6 +858,12 @@ def hidden_check():
             mark_clear(mark)
             say("окно (%s) снова на экране — таймер снят" % title[:40])
             return 0
+        if info.returncode != 0:
+            unverified += 1
+    if wins and unverified == len([w for w in wins if w.isdigit()]):
+        say("окно (%s) есть, но состояние не определить — приложение оставляю"
+            % title[:40])
+        return 0
     if "jellyfin" in title.lower():
         jelly_kill(env, "скрыто дольше %d мин" % minutes)
     elif title:
@@ -1676,31 +1702,13 @@ def key_power():
 
 
 def key_back():
+    """Одиночный Back: своя реакция в каждом режиме и окне."""
     if mode_get() == "tv":
         key_log("back → ТВ")
         return cmd_tv(["key", "BACK"])
-    gate = "/run/stb/back-gate"
-    now = time.time()
-    prev = None
-    if os.path.exists(gate):
-        try:
-            prev = os.path.getmtime(gate)
-        except OSError:
-            prev = None
-    if prev is not None and now - prev <= DOUBLE_BACK:
-        mark_clear(gate)
-        title = window_title()
-        if is_browser(title):
-            key_log("back ×2 → на сетку")
-            cmd_grid([])
-        else:
-            key_log("back ×2 → прячу приложение (%s)" % title[:30])
-            cmd_hide([])
-        return 0
-    mark_set(gate)
     title = window_title()
     if is_app(title):
-        # Одиночный Back — приложению: у Jellyfin своя навигация.
+        # У Jellyfin своя навигация: отдаём ему.
         key_log("back → приложению (%s)" % title[:30])
         xdo("key", "--clearmodifiers", "alt+Left")
         return 0
@@ -1721,6 +1729,22 @@ def key_back():
     key_log("back → скрыть окно (%s)" % title)
     return cmd_hide([])
 
+
+def key_back_double():
+    """Двойной Back: отдельное событие, одиночное нажатие сюда не уходит.
+
+    Приложение прячем (возврат тёплым, а не холодным стартом), из браузера
+    уходим на сетку, в режиме телевизора — возвращаемся на приставку.
+    """
+    if mode_get() == "tv":
+        key_log("back ×2 → на приставку")
+        return cmd_key(["tobox"])
+    title = window_title()
+    if is_browser(title):
+        key_log("back ×2 → на сетку")
+        return cmd_grid([])
+    key_log("back ×2 → прячу приложение (%s)" % title[:30])
+    return cmd_hide([])
 
 def finish_all():
     """Home на сетке: убрать всё запущенное и оставить чистую сетку."""
@@ -1856,6 +1880,8 @@ def cmd_key(argv):
     if not act:
         print("usage: stb key <действие>, список: stb keys list", file=sys.stderr)
         return 2
+    if act == "back-double":
+        return key_back_double()
     if act not in KEY_ACTIONS:
         print("неизвестное действие: %s" % act, file=sys.stderr)
         return 2

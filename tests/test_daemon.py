@@ -249,3 +249,286 @@ def wifi():
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)
     return module
+
+
+# --------------------------------------------------------------- отказ связи
+class HangingClose:
+    """Клиент, у которого close() не завершается."""
+
+    def __init__(self):
+        self.close_started = False
+
+    async def close(self):
+        self.close_started = True
+        await asyncio.sleep(30)
+
+
+def test_drop_forgets_client_before_closing(link):
+    """Зависшее закрытие не оставляет ссылку на старый клиент."""
+    client = HangingClose()
+    link._client = client
+    started = time.monotonic()
+    asyncio.run(link.safe_drop())
+    spent = time.monotonic() - started
+    assert link._client is None, "демон остался со старым клиентом"
+    assert client.close_started is True
+    assert spent < link.DROP_TIMEOUT + 0.5
+
+
+class HangingConnect:
+    """Клиент, который не успевает подключиться."""
+
+    instances = []
+
+    def __init__(self):
+        self.closed = False
+        HangingConnect.instances.append(self)
+
+    async def connect(self):
+        await asyncio.sleep(30)
+
+    async def close(self):
+        self.closed = True
+
+
+async def _fake_create(*args, **kwargs):
+    return HangingConnect()
+
+
+def test_cancelled_connect_closes_client(link, monkeypatch):
+    """Отмена на подключении не оставляет открытый сокет."""
+    HangingConnect.instances = []
+    monkeypatch.setattr(link.bscpylgtv, "WebOsClient",
+                        type("FakeWebOsClient", (), {"create": staticmethod(_fake_create)}))
+    link._client = None
+
+    async def scenario():
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(link.connect(), timeout=0.05)
+        await asyncio.sleep(0.2)          # фоновое закрытие успевает пройти
+
+    asyncio.run(scenario())
+    assert link._client is None
+    assert HangingConnect.instances, "клиент не создавался"
+    assert all(c.closed for c in HangingConnect.instances), "сокет остался открытым"
+
+
+def test_expired_budget_refuses_without_waiting(link, monkeypatch):
+    """Вышедший срок не продлевается искусственным остатком.
+
+    Срок нулевой: старое `max(0.1, ...)` всё равно дало бы 0.1 с и пустило
+    команду дальше, новое — отказывает сразу, не дойдя до телевизора.
+    """
+    calls = []
+
+    async def any_dispatch(client, cmd, req):
+        calls.append(cmd)
+        return {"ok": True}
+
+    async def ready():
+        return object()
+
+    monkeypatch.setattr(link, "ensure", ready)
+    monkeypatch.setattr(link, "dispatch", any_dispatch)
+    monkeypatch.setattr(link, "COMMAND_TIMEOUT", 0.0)
+    answer = asyncio.run(link.handle({"cmd": "key", "name": "UP"}))
+    assert answer["ok"] is False
+    assert calls == [], "команда ушла в телевизор при вышедшем сроке"
+
+
+def test_budget_leaves_room_for_answer(link):
+    """Работа и закрытие соединения оставляют клиенту запас на ответ."""
+    import stbtv
+
+    spare = stbtv.DEFAULT_TIMEOUT - (link.COMMAND_TIMEOUT + link.DROP_TIMEOUT)
+    assert spare >= 1.0, "запас до клиентского срока всего %.1f с" % spare
+
+
+# --------------------------------------------------- исход запроса: два класса
+def test_transport_not_sent_when_daemon_absent(tmp_path):
+    """Демона нет — запрос точно не ушёл."""
+    import stbtv
+
+    answer = stbtv.TvDaemon(str(tmp_path / "no.sock")).ask({"cmd": "state"}, timeout=1)
+    assert answer["transport"] is True
+    assert answer["sent"] is False
+    assert "unknown" not in answer
+
+
+def _one_shot_server(path, answer_after=None):
+    """Сервер на один запрос: читает его и закрывает связь (или отвечает)."""
+    import socket
+    import threading
+
+    srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    srv.bind(path)
+    srv.listen(1)
+
+    def serve():
+        conn, _ = srv.accept()
+        try:
+            conn.recv(65536)
+            if answer_after is not None:
+                conn.sendall(answer_after)
+        finally:
+            conn.close()
+            srv.close()
+
+    threading.Thread(target=serve, daemon=True).start()
+    return srv
+
+
+def test_transport_unknown_after_send(tmp_path):
+    """Демон принял запрос и оборвал связь: повторять нельзя."""
+    import stbtv
+
+    path = str(tmp_path / "s.sock")
+    _one_shot_server(path)
+    answer = stbtv.TvDaemon(path).ask({"cmd": "key", "name": "VOLUMEUP"}, timeout=2)
+    assert answer["transport"] is True
+    assert answer["sent"] is True
+    assert answer.get("unknown") is True
+
+
+def test_async_transport_unknown_after_send(tmp_path):
+    import stbtv
+
+    path = str(tmp_path / "a.sock")
+    _one_shot_server(path)
+    answer = asyncio.run(stbtv.TvDaemon(path).aask({"cmd": "key", "name": "VOLUMEUP"},
+                                                  timeout=2))
+    assert answer["transport"] is True
+    assert answer["sent"] is True
+    assert answer.get("unknown") is True
+
+
+def test_json_without_newline_still_parsed(tmp_path):
+    """Полный JSON без перевода строки — обычный ответ."""
+    import stbtv
+
+    path = str(tmp_path / "h.sock")
+    _one_shot_server(path, answer_after=b'{"ok": true}')
+    answer = stbtv.TvDaemon(path).ask({"cmd": "state"}, timeout=2)
+    assert answer == {"ok": True}
+
+
+def test_empty_answer_is_not_success(tmp_path):
+    """Пустой ответ — не «нулевое состояние», а обрыв: исход неизвестен."""
+    import stbtv
+
+    path = str(tmp_path / "e.sock")
+    _one_shot_server(path)                     # прочитал запрос и молча закрыл
+    answer = stbtv.TvDaemon(path).ask({"cmd": "state"}, timeout=2)
+    assert answer.get("ok") is not True
+    assert answer["transport"] is True
+    assert answer["sent"] is True
+
+def test_cli_no_fallback_when_outcome_unknown(cli, monkeypatch):
+    """Демон умер после отправки — громкость не повторяем."""
+    calls = []
+    monkeypatch.setattr(cli, "daemon", lambda: Answer(
+        {"ok": False, "transport": True, "sent": True, "unknown": True}))
+    monkeypatch.setattr(cli, "daemon_alive", lambda: False)
+    monkeypatch.setattr(cli, "cli_call", lambda *a, **k: calls.append(a))
+    rc = cli.tv_command({"cmd": "vol", "dir": "up"}, "volumeup")
+    assert rc == 1
+    assert calls == [], "команда повторена после неизвестного исхода"
+
+
+def test_wifi_no_fallback_when_outcome_unknown(wifi, monkeypatch):
+    monkeypatch.setattr(wifi, "daemon_alive", lambda: False)
+    assert wifi.should_use_cli({"transport": True, "sent": True}) is False
+    assert wifi.should_use_cli({"transport": True, "sent": False, "ok": False}) is True
+
+
+# ------------------------------------------------- скрытое окно и отказ X11
+class RunResult:
+    def __init__(self, returncode=0, stdout=""):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = ""
+
+
+@pytest.fixture
+def hidden(cli, tmp_path, monkeypatch):
+    """Отметка скрытого окна постарела на 20 минут; X подменяется."""
+    mark = tmp_path / "stb-app-hidden"
+    mark.write_text("Jellyfin Desktop", encoding="utf-8")
+    old = time.time() - 20 * 60
+    os.utime(str(mark), (old, old))
+
+    killed = []
+    monkeypatch.setattr(cli, "hidden_mark", lambda: str(mark))
+    monkeypatch.setattr(cli, "user_env", lambda: {})
+    monkeypatch.setattr(cli, "say", lambda *a, **k: None)
+    monkeypatch.setattr(cli, "mark_clear", lambda *a, **k: None)
+    monkeypatch.setattr(cli.stbconf, "get",
+                        lambda name, default="": "10" if name == "APP_HIDE_MINUTES" else default)
+    monkeypatch.setattr(cli, "jelly_kill", lambda env, why: killed.append(why))
+    return killed
+
+
+def test_hidden_x_error_does_not_kill_app(hidden, cli, monkeypatch):
+    """xdotool не смог спросить X — приложение не закрываем."""
+    monkeypatch.setattr(cli.subprocess, "run",
+                        lambda *a, **k: RunResult(returncode=3, stdout=""))
+    cli.hidden_check()
+    assert hidden == [], "приложение закрыто при отказе X"
+
+
+def test_hidden_unviewable_unverified_does_not_kill(hidden, cli, monkeypatch):
+    """Окно есть, но xwininfo не отвечает — тоже не закрываем."""
+    def run(cmd, *a, **k):
+        if cmd[0] == "xdotool":
+            return RunResult(0, "12345\n")
+        return RunResult(returncode=2, stdout="")
+
+    monkeypatch.setattr(cli.subprocess, "run", run)
+    cli.hidden_check()
+    assert hidden == [], "приложение закрыто без подтверждения состояния окна"
+
+
+def test_hidden_without_windows_kills(hidden, cli, monkeypatch):
+    """xdotool: подходящих окон нет (код 1) — это и значит «скрыто»."""
+    def run(cmd, *a, **k):
+        if cmd[0] == "xdotool":
+            return RunResult(1, "")
+        return RunResult(returncode=1, stdout="")
+
+    monkeypatch.setattr(cli.subprocess, "run", run)
+    cli.hidden_check()
+    assert hidden, "приложение не закрыто, хотя окна нет"
+
+
+# --------------------------------------------- приёмник пульта без карты кнопок
+def test_wifi_imports_without_keymap(tmp_path, monkeypatch):
+    """Пропавшая карта кнопок не должна ронять приёмник на импорте.
+
+    Раньше `KEYS = load_keymap()` звал `w()` до его определения: при
+    отсутствующем buttons-wifi.conf модуль падал с NameError, и пульт
+    переставал приниматься целиком. Заодно проверяется, что импорт не пишет
+    в конфиг: UUID придумывается при старте службы, а не при загрузке модуля.
+    """
+    import importlib.machinery
+    import importlib.util
+
+    import stbconf
+
+    nl = chr(10)
+    monkeypatch.setenv("FAKETV_LOG", str(tmp_path / "faketv.log"))
+    empty = tmp_path / "cfg"
+    empty.mkdir()
+    conf = empty / "stb.conf"
+    original = 'WF_UUID=""' + nl
+    conf.write_text(original, encoding="utf-8")
+    monkeypatch.setattr(stbconf, "CONFIG", str(conf))
+    monkeypatch.setattr(stbconf, "get",
+                        lambda name, default="": str(empty) if name == "STB_CONFIG_DIR" else default)
+
+    loader = importlib.machinery.SourceFileLoader(
+        "stb_wifi_nokeymap", os.path.join(ROOT, "bin/stb-wifi-remote"))
+    spec = importlib.util.spec_from_loader("stb_wifi_nokeymap", loader)
+    module = importlib.util.module_from_spec(spec)
+    loader.exec_module(module)
+    assert module.KEYS == {}
+    assert conf.read_text(encoding="utf-8") == original, "импорт переписал конфиг"
