@@ -76,3 +76,48 @@ def _number(getter, key, default):
         return float(getter(key, str(default)))
     except (TypeError, ValueError):
         return default
+
+
+class Ledger:
+    """Что придержано сейчас и чей срок ещё в силе.
+
+    Живёт в одном потоке — цикле событий: срок ставит `loop.call_later`, отмена
+    и отправка происходят там же. Главная гарантия: `_fire` выходит, если
+    нажатия в учёте уже нет. Поэтому даже опоздавшая отмена (таймер уже
+    проснулся) не даёт второго действия — нажатие уйдёт ровно один раз.
+    """
+
+    def __init__(self):
+        self._held = {}
+
+    def __contains__(self, name):
+        return name in self._held
+
+    def names(self):
+        return list(self._held)
+
+    def other_than(self, name):
+        """Придержанные кнопки, кроме указанной."""
+        return [held for held in self._held if held != name]
+
+    def hold(self, loop, name, delay, fire):
+        """Придержать нажатие: `fire(name)` вызовут, если второго не будет."""
+        self.cancel(name)
+        self._held[name] = loop.call_later(delay, self._fire, name, fire)
+
+    def _fire(self, name, fire):
+        if self._held.pop(name, None) is None:
+            return
+        fire(name)
+
+    def cancel(self, name):
+        """Отменить придержанное; True — если было что отменять."""
+        handle = self._held.pop(name, None)
+        if handle is None:
+            return False
+        handle.cancel()
+        return True
+
+    def take(self, name):
+        """Забрать нажатие под немедленную отправку: порядок важнее окна."""
+        return self.cancel(name)

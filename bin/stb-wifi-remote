@@ -22,7 +22,6 @@ STB_USER = _stbconf.get("STB_USER", "stbuser")
 """
 import asyncio
 import json
-import threading
 import uuid as _uuid
 import io
 import os
@@ -186,41 +185,41 @@ async def arun(cmd, timeout=25):
 
 
 def _hold_single(name, gest):
-    """Придержать одиночное нажатие: уйдёт, если второго не будет."""
-    timer = threading.Timer(gest.window, _fire_single, args=(name,))
-    timer.daemon = True
-    PENDING[name] = timer
-    timer.start()
+    """Придержать одиночное нажатие: уйдёт, если второго не будет.
+
+    Срок ставит сам цикл событий (call_later), а не отдельный поток: тогда
+    учёт придержанных, отмена и отправка живут в одном потоке, и одно нажатие
+    не может уйти дважды.
+    """
+    loop = LOOP[0]
+    if loop is None:
+        return
+    PENDING.hold(loop, name, gest.window, _fire_single)
 
 
 def _fire_single(name):
-    """Окно прошло: нажатие было одиночным."""
-    PENDING.pop(name, None)
+    """Окно прошло: нажатие было одиночным. Вызывается только из цикла."""
     gest = GESTURES.get(name)
     if gest is not None:
         gest.fired()
-    if LOOP[0] is not None:
-        LOOP[0].call_soon_threadsafe(
-            lambda: asyncio.ensure_future(do_action(name.lower())))
+    asyncio.ensure_future(do_action(name.lower()))
 
 
 def _cancel_single(name):
     """Двойное нажатие: придержанное одиночное не отправляем."""
-    timer = PENDING.pop(name, None)
-    if timer is not None:
-        timer.cancel()
+    PENDING.cancel(name)
 
 
-async def _flush_pending():
+async def _flush_pending(keep=None):
     """Придержанные кнопки уходят раньше новой — в порядке нажатий.
 
     Драйвер не знает про режимы: он лишь не даёт старому нажатию прийти после
     нового. Пауза между ними — чтобы две реакции не слиплись в одну.
+    `keep` — своя кнопка: её не трогаем, для неё решает распознавание жеста.
     """
-    for held in list(PENDING):
-        timer = PENDING.pop(held, None)
-        if timer is not None:
-            timer.cancel()
+    for held in PENDING.other_than(keep):
+        if not PENDING.take(held):
+            continue
         gest = GESTURES.get(held)
         if gest is not None:
             gest.fired()
@@ -259,7 +258,7 @@ async def do_action(name):
     if mode() == "tv":
         req = stbkeys.request(act)
         if req is not None:
-            # 8 с — дольше бюджета демона (6 с): иначе клиент бросает команду,
+            # 8 с — дольше бюджета демона (5 с): иначе клиент бросает команду,
             # демон всё ещё её выполняет, а пульт шлёт повтор.
             resp = await TV_DAEMON.aask(req, timeout=8)
             if resp.get("ok"):
@@ -368,7 +367,7 @@ PTR = Pointer(run=arun, mode=mode, tv=TV_DAEMON_OBJ, x11=X11, log=w,
               speed=float(stbconf.get("POINTER_SPEED", "0.35") or 0.35))
 TEXT = TextBuffer(run=arun, mode=mode, log=w)      # буфер текста с телефона
 GESTURES = stbgesture.load(stbconf.get)   # кнопки с выдержкой (сейчас BACK)
-PENDING = {}                              # кнопка → таймер придержанного нажатия
+PENDING = stbgesture.Ledger()             # что придержано (сроки — в цикле событий)
 LOOP = [None]   # цикл событий: таймер придержанного нажатия живёт в потоке
 
 
@@ -563,6 +562,10 @@ async def handle(reader, writer):
                 continue
 
             if name in GESTURES:
+                # Другая придержанная кнопка уходит раньше: при двух жестах
+                # порядок нажатий ломался бы так же, как с обычными кнопками.
+                if PENDING.other_than(name):
+                    await _flush_pending(keep=name)
                 gest = GESTURES[name]
                 if gest.duplicate(time.monotonic()):
                     w(f"КНОПКА: {name} (повтор того же нажима)")

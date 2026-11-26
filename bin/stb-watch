@@ -58,6 +58,7 @@ def log(section, msg):
 
 # ═══════════════════════════════════════════════════════════ телевизор
 STB_HOME = stbconf.get("STB_HOME", "/home/stbuser")
+STB_USER = stbconf.get("STB_USER", "stbuser")
 TV = stbconf.get("TV_IP", "")
 TV_INPUT = stbconf.get("TV_INPUT_ID", "")
 INPUT_ON_WAKE = str(stbconf.get("TV_INPUT_ON_WAKE", "0")).strip() in ("1", "yes", "true")
@@ -67,7 +68,7 @@ UNKNOWN_LIMIT = float(stbconf.get("TV_UNKNOWN_LIMIT", "180") or 180)
 _unknown_since = None
 CHECK_EVERY = 4
 # Срок запроса к демону — как у остальных клиентов (8 с): демон тратит на
-# команду до 6 с, и короткий срок сторожа заставлял бы его сдаваться раньше
+# команду до 5 с, и короткий срок сторожа заставлял бы его сдаваться раньше
 # демона. Медленный ответ растягивает один тик, но только если телевизор
 # отвечает по сети (иначе SSAP вообще не спрашиваем) — это плата за
 # осмысленное решение вместо догадки.
@@ -133,8 +134,9 @@ def ask_power_direct():
     """Состояние питания своим соединением, мимо демона; пусто — не спросилось."""
     try:
         out = subprocess.run(
-            ["sudo", "-n", "-u", "stbuser", "env", "HOME=/home/stbuser",
-             "/usr/bin/python3", "/opt/stb/lib/tv_setting.py", "power"],
+            ["sudo", "-n", "-u", STB_USER, "env", "HOME=%s" % STB_HOME,
+             os.path.join(STB_HOME, "tvctl", "bin", "python"),
+             "/opt/stb/lib/tv_setting.py", "power"],
             capture_output=True, text=True, timeout=12)
     except (OSError, subprocess.SubprocessError):
         return ""
@@ -167,7 +169,7 @@ def tv_is_on():
     """Состояние телевизора с учётом свежести и видимости в сети."""
     global _last_state, _last_on, _net_misses  # pylint: disable=global-statement
     # Сначала пинг (1 с). Если телевизор ушёл из сети, спрашивать SSAP
-    # бессмысленно: ожидание ответа демона — 6 с на каждый опрос.
+    # бессмысленно: ожидание ответа демона — 5 с на каждый опрос.
     was_offline = _net_misses >= 2      # до этого опроса телевизора не было в сети
     online = tv_in_network()
     if online:
