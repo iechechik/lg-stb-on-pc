@@ -182,7 +182,11 @@ def tv_is_on():
     # Долгое молчание SSAP при живом пинге: демон отдаёт устаревшее состояние,
     # и «включён» держалось бы вечно. Через UNKNOWN_LIMIT спрашиваем питание сами.
     global _unknown_since  # pylint: disable=global-statement
-    if online and not state:
+    # Неизвестность — это не только пустое состояние, но и устаревшее: демон может
+    # отдавать старый Active (питание обновлялось десять минут назад), и тогда
+    # «включён» держалось бы вечно, а прямой запрос не случался бы вовсе.
+    unknown = (not state) or age is None or age > STATE_MAX_AGE
+    if online and unknown:
         now = time.monotonic()
         if _unknown_since is None:
             _unknown_since = now
@@ -193,10 +197,11 @@ def tv_is_on():
                 log("tv", "демон молчит %.0f с — спросил питание напрямую: %s"
                     % (UNKNOWN_LIMIT, asked))
                 state, age = asked, 0.0
+                unknown = False
     else:
         _unknown_since = None
 
-    if online and not state:
+    if online and unknown:
         # Молчание SSAP при телевизоре, который отвечает в сети, — это сбой
         # связи, а не включение. Быстрый подъём интерфейса оставляем только для
         # настоящего пробуждения: до этого телевизора не было в сети, и мы

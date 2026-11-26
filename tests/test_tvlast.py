@@ -53,10 +53,10 @@ def test_watcher_remembers_and_tile_restores():
     assert "import stbtvlast" in watch
     assert "stbtvlast.remember(" in watch
 
-    stb = io.open(os.path.join(ROOT, "bin/stb"), encoding="utf-8").read()
-    start = stb.index("def cmd_live(")
-    end = stb.find("\ndef ", start + 5)
-    live = stb[start:] if end == -1 else stb[start:end]
+    desk = io.open(os.path.join(ROOT, "lib/stbdesktop.py"), encoding="utf-8").read()
+    start = desk.index("def cmd_live(")
+    end = desk.find("\ndef ", start + 5)
+    live = desk[start:] if end == -1 else desk[start:end]
     assert "stbtvlast.last(" in live, "плитка открывает запомненное"
     assert "TV_FALLBACK_APP" in live, "без памяти есть запасное приложение"
     assert "TV_RESTORE_LAST" in live, "память можно выключить"

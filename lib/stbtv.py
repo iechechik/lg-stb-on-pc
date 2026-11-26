@@ -48,8 +48,11 @@ class TvDaemon:
             s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
             s.settimeout(max(0.05, deadline - time.monotonic()))
             s.connect(self.path)
-            s.sendall((json.dumps(req, ensure_ascii=False) + "\n").encode("utf-8"))
+            # С этого момента исход неизвестен: часть запроса могла уйти, даже если
+            # sendall() упадёт. Повторять такие команды нельзя (громкость и Back
+            # не идемпотентны), поэтому признак ставится ДО отправки.
             sent = True
+            s.sendall((json.dumps(req, ensure_ascii=False) + "\n").encode("utf-8"))
             data = b""
             while not data.endswith(b"\n"):
                 rest = deadline - time.monotonic()

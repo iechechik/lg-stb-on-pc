@@ -31,7 +31,7 @@ def map_actions(path):
 
 def dispatcher_actions():
     """Действия, которые знает диспетчер: KEY_ACTIONS из самой команды stb."""
-    loader = importlib.machinery.SourceFileLoader("stb_cli_maps", str(ROOT / "bin/stb"))
+    loader = importlib.machinery.SourceFileLoader("stb_cli_maps", str(ROOT / "lib/stbactions.py"))
     spec = importlib.util.spec_from_loader("stb_cli_maps", loader)
     module = importlib.util.module_from_spec(spec)
     loader.exec_module(module)

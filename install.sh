@@ -29,7 +29,7 @@ if [ "${1:-}" = "--check" ]; then
     echo "== проверка архива (ничего не меняем) =="
     problems=0
     need="bin/stb bin/stb-watch bin/stb-wifi-remote bin/stb-tv-link \
-lib/stbcommon.py lib/stbtv.py lib/stbgesture.py lib/stbtvlast.py lib/stbx11.py lib/stbconf.py lib/stbconf.sh \
+lib/stbcommon.py lib/stbtvcmd.py lib/stbdesktop.py lib/stbactions.py lib/stbtv.py lib/stbgesture.py lib/stbtvlast.py lib/stbx11.py lib/stbconf.py lib/stbconf.sh \
 lib/stbkeys.py lib/stbpointer.py lib/stbtext.py lib/stbws.py lib/tv_setting.py \
 web/index.html web/stb-web.py config/stb.conf config/tiles.json \
 README.md tests/run_tests.sh tests/test_docs.py \

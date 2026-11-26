@@ -8,6 +8,8 @@ import time
 
 import pytest
 
+import stbdesktop
+
 ROOT = os.environ.get("STB_ROOT", "/opt/stb")
 
 
@@ -167,40 +169,40 @@ class Answer:
         return self.payload
 
 
-def test_refusal_does_not_fall_back(cli, monkeypatch):
+def test_refusal_does_not_fall_back(tvcmd, monkeypatch):
     """Телевизор отказал — прямое подключение не открываем."""
     calls = []
-    monkeypatch.setattr(cli, "daemon", lambda: Answer({"ok": False, "msg": "нет"}))
-    monkeypatch.setattr(cli, "daemon_alive", lambda: True)
-    monkeypatch.setattr(cli, "cli_call", lambda *a, **k: calls.append(a))
-    rc = cli.tv_command({"cmd": "key", "name": "UP"}, "button", "UP")
+    monkeypatch.setattr(tvcmd, "daemon", lambda: Answer({"ok": False, "msg": "нет"}))
+    monkeypatch.setattr(tvcmd, "daemon_alive", lambda: True)
+    monkeypatch.setattr(tvcmd, "cli_call", lambda *a, **k: calls.append(a))
+    rc = tvcmd.tv_command({"cmd": "key", "name": "UP"}, "button", "UP")
     assert rc == 1
     assert calls == []
 
 
-def test_dead_daemon_falls_back(cli, monkeypatch):
+def test_dead_daemon_falls_back(tvcmd, monkeypatch):
     """Демона нет вовсе — прямое подключение разрешено."""
     calls = []
 
     class Done:
         returncode = 0
 
-    monkeypatch.setattr(cli, "daemon", lambda: Answer({"ok": False, "transport": True}))
-    monkeypatch.setattr(cli, "daemon_alive", lambda: False)
-    monkeypatch.setattr(cli, "need_tv", lambda: None)
-    monkeypatch.setattr(cli, "cli_call", lambda *a, **k: (calls.append(a), Done())[1])
-    rc = cli.tv_command({"cmd": "key", "name": "UP"}, "button", "UP")
+    monkeypatch.setattr(tvcmd, "daemon", lambda: Answer({"ok": False, "transport": True}))
+    monkeypatch.setattr(tvcmd, "daemon_alive", lambda: False)
+    monkeypatch.setattr(tvcmd, "need_tv", lambda: None)
+    monkeypatch.setattr(tvcmd, "cli_call", lambda *a, **k: (calls.append(a), Done())[1])
+    rc = tvcmd.tv_command({"cmd": "key", "name": "UP"}, "button", "UP")
     assert rc == 0
     assert calls == [("button", "UP")]
 
 
-def test_live_silent_daemon_does_not_fall_back(cli, monkeypatch):
+def test_live_silent_daemon_does_not_fall_back(tvcmd, monkeypatch):
     """Демон жив, но молчит — ждём его, второе соединение не открываем."""
     calls = []
-    monkeypatch.setattr(cli, "daemon", lambda: Answer({"ok": False, "transport": True}))
-    monkeypatch.setattr(cli, "daemon_alive", lambda: True)
-    monkeypatch.setattr(cli, "cli_call", lambda *a, **k: calls.append(a))
-    rc = cli.tv_command({"cmd": "key", "name": "UP"}, "button", "UP")
+    monkeypatch.setattr(tvcmd, "daemon", lambda: Answer({"ok": False, "transport": True}))
+    monkeypatch.setattr(tvcmd, "daemon_alive", lambda: True)
+    monkeypatch.setattr(tvcmd, "cli_call", lambda *a, **k: calls.append(a))
+    rc = tvcmd.tv_command({"cmd": "key", "name": "UP"}, "button", "UP")
     assert rc == 1
     assert calls == []
 
@@ -436,14 +438,14 @@ def test_empty_answer_is_not_success(tmp_path):
     assert answer["transport"] is True
     assert answer["sent"] is True
 
-def test_cli_no_fallback_when_outcome_unknown(cli, monkeypatch):
+def test_cli_no_fallback_when_outcome_unknown(tvcmd, monkeypatch):
     """Демон умер после отправки — громкость не повторяем."""
     calls = []
-    monkeypatch.setattr(cli, "daemon", lambda: Answer(
+    monkeypatch.setattr(tvcmd, "daemon", lambda: Answer(
         {"ok": False, "transport": True, "sent": True, "unknown": True}))
-    monkeypatch.setattr(cli, "daemon_alive", lambda: False)
-    monkeypatch.setattr(cli, "cli_call", lambda *a, **k: calls.append(a))
-    rc = cli.tv_command({"cmd": "vol", "dir": "up"}, "volumeup")
+    monkeypatch.setattr(tvcmd, "daemon_alive", lambda: False)
+    monkeypatch.setattr(tvcmd, "cli_call", lambda *a, **k: calls.append(a))
+    rc = tvcmd.tv_command({"cmd": "vol", "dir": "up"}, "volumeup")
     assert rc == 1
     assert calls == [], "команда повторена после неизвестного исхода"
 
@@ -471,45 +473,45 @@ def hidden(cli, tmp_path, monkeypatch):
     os.utime(str(mark), (old, old))
 
     killed = []
-    monkeypatch.setattr(cli, "hidden_mark", lambda: str(mark))
-    monkeypatch.setattr(cli, "user_env", lambda: {})
-    monkeypatch.setattr(cli, "say", lambda *a, **k: None)
-    monkeypatch.setattr(cli, "mark_clear", lambda *a, **k: None)
-    monkeypatch.setattr(cli.stbconf, "get",
+    monkeypatch.setattr(stbdesktop, "hidden_mark", lambda: str(mark))
+    monkeypatch.setattr(stbdesktop, "user_env", lambda: {})
+    monkeypatch.setattr(stbdesktop, "say", lambda *a, **k: None)
+    monkeypatch.setattr(stbdesktop, "mark_clear", lambda *a, **k: None)
+    monkeypatch.setattr(stbdesktop.stbconf, "get",
                         lambda name, default="": "10" if name == "APP_HIDE_MINUTES" else default)
-    monkeypatch.setattr(cli, "jelly_kill", lambda env, why: killed.append(why))
+    monkeypatch.setattr(stbdesktop, "jelly_kill", lambda env, why: killed.append(why))
     return killed
 
 
-def test_hidden_x_error_does_not_kill_app(hidden, cli, monkeypatch):
+def test_hidden_x_error_does_not_kill_app(hidden, monkeypatch):
     """xdotool не смог спросить X — приложение не закрываем."""
-    monkeypatch.setattr(cli.subprocess, "run",
+    monkeypatch.setattr(stbdesktop.subprocess, "run",
                         lambda *a, **k: RunResult(returncode=3, stdout=""))
-    cli.hidden_check()
+    stbdesktop.hidden_check()
     assert hidden == [], "приложение закрыто при отказе X"
 
 
-def test_hidden_unviewable_unverified_does_not_kill(hidden, cli, monkeypatch):
+def test_hidden_unviewable_unverified_does_not_kill(hidden, monkeypatch):
     """Окно есть, но xwininfo не отвечает — тоже не закрываем."""
     def run(cmd, *a, **k):
         if cmd[0] == "xdotool":
             return RunResult(0, "12345\n")
         return RunResult(returncode=2, stdout="")
 
-    monkeypatch.setattr(cli.subprocess, "run", run)
-    cli.hidden_check()
+    monkeypatch.setattr(stbdesktop.subprocess, "run", run)
+    stbdesktop.hidden_check()
     assert hidden == [], "приложение закрыто без подтверждения состояния окна"
 
 
-def test_hidden_without_windows_kills(hidden, cli, monkeypatch):
+def test_hidden_without_windows_kills(hidden, monkeypatch):
     """xdotool: подходящих окон нет (код 1) — это и значит «скрыто»."""
     def run(cmd, *a, **k):
         if cmd[0] == "xdotool":
             return RunResult(1, "")
         return RunResult(returncode=1, stdout="")
 
-    monkeypatch.setattr(cli.subprocess, "run", run)
-    cli.hidden_check()
+    monkeypatch.setattr(stbdesktop.subprocess, "run", run)
+    stbdesktop.hidden_check()
     assert hidden, "приложение не закрыто, хотя окна нет"
 
 

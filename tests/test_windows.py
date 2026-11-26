@@ -10,6 +10,8 @@ import os
 
 import pytest
 
+import stbcommon
+
 ROOT = os.environ.get("STB_ROOT", "/opt/stb")
 
 
@@ -28,30 +30,30 @@ APP = "Jellyfin Desktop"
 
 
 def test_grid_is_our_grid(cli):
-    assert cli.is_grid(GRID) is True
-    assert cli.is_grid(APP) is False
+    assert stbcommon.is_grid(GRID) is True
+    assert stbcommon.is_grid(APP) is False
 
 
 def test_browser_window_counts_as_browser(cli):
-    assert cli.is_browser(GRID) is True      # сетка живёт в браузере
-    assert cli.is_browser(SITE) is True
-    assert cli.is_browser(APP) is False
+    assert stbcommon.is_browser(GRID) is True      # сетка живёт в браузере
+    assert stbcommon.is_browser(SITE) is True
+    assert stbcommon.is_browser(APP) is False
 
 
 def test_ours_covers_grid_and_browser(cli):
-    assert cli.is_ours(GRID) is True
-    assert cli.is_ours(SITE) is True
-    assert cli.is_ours(APP) is False
+    assert stbcommon.is_ours(GRID) is True
+    assert stbcommon.is_ours(SITE) is True
+    assert stbcommon.is_ours(APP) is False
 
 
 def test_app_is_everything_else_with_title(cli):
-    assert cli.is_app(APP) is True
-    assert cli.is_app(GRID) is False
-    assert cli.is_app("") is False           # пустой заголовок — не приложение
+    assert stbcommon.is_app(APP) is True
+    assert stbcommon.is_app(GRID) is False
+    assert stbcommon.is_app("") is False           # пустой заголовок — не приложение
 
 
 def test_titles_are_single_source(cli):
     """Заголовки заданы константами, а не рассыпаны строками по коду."""
     import stbcommon
-    assert cli.GRID_TITLE == "Приставка"
+    assert stbcommon.GRID_TITLE == "Приставка"
     assert stbcommon.BROWSER_TITLE == "Mozilla"

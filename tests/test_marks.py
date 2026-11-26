@@ -12,6 +12,9 @@ import sys
 
 import pytest
 
+import stbcommon
+import stbdesktop
+
 ROOT = os.environ.get("STB_ROOT", "/opt/stb")
 sys.path.insert(0, os.path.join(ROOT, "lib"))
 CLI = os.path.join(ROOT, "bin/stb")
@@ -29,22 +32,22 @@ def cli():
 def test_markers_roundtrip(cli, tmp_path):
     """Отметка ставится, читается, снимается; возраст считается."""
     path = str(tmp_path / "mark")
-    assert cli.mark_read(path, "нет") == "нет"
-    assert cli.mark_age(path) is None
+    assert stbcommon.mark_read(path, "нет") == "нет"
+    assert stbdesktop.mark_age(path) is None
 
-    assert cli.mark_set(path, "значение") is True
-    assert cli.mark_read(path) == "значение"
-    assert cli.mark_age(path) == 0
+    assert stbcommon.mark_set(path, "значение") is True
+    assert stbcommon.mark_read(path) == "значение"
+    assert stbdesktop.mark_age(path) == 0
 
-    cli.mark_clear(path)
-    assert cli.mark_read(path, "нет") == "нет"
-    assert cli.mark_age(path) is None
+    stbcommon.mark_clear(path)
+    assert stbcommon.mark_read(path, "нет") == "нет"
+    assert stbdesktop.mark_age(path) is None
 
 
 def test_mark_clear_tolerates_missing(cli, tmp_path):
     """Снятие несуществующей отметки — не ошибка."""
-    cli.mark_clear(str(tmp_path / "нет-такого"))
-    cli.mark_clear(str(tmp_path / "a"), str(tmp_path / "b"))
+    stbcommon.mark_clear(str(tmp_path / "нет-такого"))
+    stbcommon.mark_clear(str(tmp_path / "a"), str(tmp_path / "b"))
 
 
 def test_no_self_recursion_in_stb():

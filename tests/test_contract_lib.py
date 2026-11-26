@@ -73,7 +73,7 @@ def test_ssap_uris_have_no_scheme():
 
 def test_tv_text_reports_refusal():
     """Отказ телевизора (returnValue: false) должен быть виден, а не «отправлено»."""
-    src = io.open(os.path.join(ROOT, "bin", "stb"), encoding="utf-8").read()
+    src = io.open(os.path.join(ROOT, "lib", "stbtvcmd.py"), encoding="utf-8").read()
     assert 'reply.get("returnValue") is False' in src
     assert "телевизор отказал" in src
 

@@ -11,14 +11,14 @@ def read(rel):
 
 def func(name):
     """Текст функции из bin/stb по имени (до следующего определения)."""
-    s = read("bin/stb")
+    s = read("lib/stbactions.py")
     start = s.index("def %s(" % name)
     end = s.find("\ndef ", start + 5)
     return s[start:] if end == -1 else s[start:end]
 
 
 def test_two_handlers_exist():
-    s = read("bin/stb")
+    s = read("lib/stbactions.py")
     assert "def key_back():" in s
     assert "def key_back_double():" in s
 
@@ -49,7 +49,7 @@ def test_double_back_keeps_its_specifics():
 
 
 def test_dispatcher_knows_double_action():
-    s = read("bin/stb")
+    s = read("lib/stbactions.py")
     assert 'if act == "back-double":' in s
     assert (s.index('if act == "back-double":')
             < s.index("if act not in KEY_ACTIONS:")), "двойное до проверки имён"

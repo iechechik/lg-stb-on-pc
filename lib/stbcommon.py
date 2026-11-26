@@ -17,6 +17,11 @@ STB_USER = stbconf.get("STB_USER", "stbuser")
 TV = stbconf.get("TV_IP", "")
 TV_PORT = stbconf.get("TV_PORT", "3000")
 
+# Путь к bin/stb для самоперезапуска (команды зовут сами себя с другими
+# аргументами). bin/stb уточняет его при старте через __file__; в тестах
+# остаётся sys.argv[0], и это ожидаемо.
+SELF = sys.argv[0]
+
 MODE_FILE = "/run/stb/mode"
 SCREEN_FLAG = "/run/stb/screensaver"
 LOGS = {
@@ -102,6 +107,11 @@ def user_uid():
     return pwd.getpwnam(STB_USER).pw_uid
 
 
+def user_gid():
+    import pwd
+    return pwd.getpwnam(STB_USER).pw_gid
+
+
 def user_env():
     uid = user_uid()
     return dict(os.environ, HOME=STB_HOME, DISPLAY=":0",
@@ -172,7 +182,10 @@ def mode_set(new):
 
 def current_app():
     """Что сейчас на экране телевизора, одной строкой."""
-    app = daemon().state().get("app")
+    try:
+        app = (daemon().ask({"cmd": "state"}, timeout=3).get("state") or {}).get("app")
+    except Exception:  # noqa: BLE001
+        app = None
     if app:
         return str(app)
     return cli_call("get_current_app").stdout.strip().splitlines()[-1] if tv_alive() else ""

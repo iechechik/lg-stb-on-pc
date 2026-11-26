@@ -34,6 +34,12 @@ def stbweb():
 
 
 @pytest.fixture(scope="session")
+def tvcmd(tvtext):
+    """Команды телевизора живут в lib/stbtvcmd.py — тесты бьют туда же."""
+    return tvtext
+
+
+@pytest.fixture(scope="session")
 def tvtext():
     """Утилита ввода текста в телевизор: разбор аргументов."""
-    return load(os.path.join(ROOT, "bin/stb"), "stb_cli")
+    return load(os.path.join(ROOT, "lib/stbtvcmd.py"), "stb_tvcmd")
