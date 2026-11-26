@@ -211,6 +211,23 @@ def _cancel_single(name):
         timer.cancel()
 
 
+async def _flush_pending():
+    """Придержанные кнопки уходят раньше новой — в порядке нажатий.
+
+    Драйвер не знает про режимы: он лишь не даёт старому нажатию прийти после
+    нового. Пауза между ними — чтобы две реакции не слиплись в одну.
+    """
+    for held in list(PENDING):
+        timer = PENDING.pop(held, None)
+        if timer is not None:
+            timer.cancel()
+        gest = GESTURES.get(held)
+        if gest is not None:
+            gest.fired()
+        await do_action(held.lower())
+        await asyncio.sleep(0.1)
+
+
 def daemon_alive():
     """Служба демона запущена? Сокет может остаться от прошлого запуска."""
     try:
@@ -559,6 +576,7 @@ async def handle(reader, writer):
                     w(f"КНОПКА: {name} (придержан, окно {gest.window:.1f} с)")
                     _hold_single(name, gest)
                 continue
+            await _flush_pending()
             w(f"КНОПКА: {name}")
             await do_action(name)
             continue

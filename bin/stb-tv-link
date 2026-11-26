@@ -62,6 +62,26 @@ def log(msg):
 # Подписок на события нет (states=[] в connect): состояние берётся опросом,
 # поэтому обработчиков on_power/on_sound/on_app здесь намеренно нет.
 
+async def port_open(timeout=0.4):
+    """Принимает ли телевизор соединения вообще.
+
+    Спящий LG не отвечает на TCP: ждать полный срок подключения (секунды)
+    незачем — кнопка должна получить отказ сразу.
+    """
+    try:
+        _, writer = await asyncio.wait_for(
+            asyncio.open_connection(TV, int(stbconf.get("TV_PORT", "3000"))),
+            timeout=timeout)
+    except (OSError, asyncio.TimeoutError):
+        return False
+    try:
+        writer.close()
+        await asyncio.wait_for(writer.wait_closed(), timeout=0.2)
+    except Exception:  # noqa: BLE001
+        pass
+    return True
+
+
 async def connect():
     """Новое соединение + подписки. Вызывается только под замком."""
     global _client  # pylint: disable=global-statement
@@ -296,6 +316,11 @@ async def handle(req):
         log("команда %s не дождалась очереди за %.0f с" % (cmd, COMMAND_TIMEOUT))
         return {"ok": False, "msg": "демон занят другой командой"}
     try:
+        if _client is None or not _client.is_connected():
+            # Спящий телевизор отбивается мгновенно, а не через три секунды.
+            if not await port_open():
+                log("команда %s: телевизора нет в сети — отвечаю сразу" % cmd)
+                return {"ok": False, "msg": "телевизор спит"}
         try:
             client = await asyncio.wait_for(ensure(), timeout=left())
         except Exception as exc:  # noqa: BLE001

@@ -9,7 +9,6 @@ import subprocess
 import sys
 import time
 import stbconf
-from stbtv import TvDaemon
 
 
 STB_HOME = stbconf.get("STB_HOME", "/home/stbuser")
@@ -98,6 +97,14 @@ def say(msg):
 
 
 def daemon():
+    """Клиент демона телевизора.
+
+    Импорт внутри: `stbtv` тянет asyncio, а это около 145 мс на каждый запуск.
+    Платить их за кнопку пульта незачем — asyncio нужен только тем командам,
+    что разговаривают с телевизором.
+    """
+    from stbtv import TvDaemon  # noqa: PLC0415
+
     return TvDaemon()
 
 

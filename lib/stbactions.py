@@ -107,7 +107,9 @@ def key_back():
     if is_browser(title):
         before = title
         xdo("key", "--clearmodifiers", "alt+Left")
-        time.sleep(0.6)
+        # 0.25 с хватает, чтобы страница ушла назад; полсекунды на кнопке
+        # чувствовались как «она задумалась».
+        time.sleep(0.25)
         after = window_title()
         if before == after:
             if is_grid(after):
