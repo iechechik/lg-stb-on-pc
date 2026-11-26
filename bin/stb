@@ -30,13 +30,45 @@ import sys
 
 sys.path.insert(0, "/opt/stb/lib")
 import stbconf  # noqa: E402
-from stbtv import TvDaemon  # noqa: E402
 import stbtvlast  # noqa: E402
+from stbcommon import (  # noqa: E402
+    CLI,
+    GRID_TITLE,
+    PY,
+    SCREEN_FLAG,
+    STB_HOME,
+    STB_USER,
+    TV,
+    TVCTL,
+    TV_PORT,
+    as_user,
+    cli_call,
+    current_app,
+    daemon,
+    idle_log,
+    is_app,
+    is_browser,
+    is_grid,
+    is_ours,
+    key_log,
+    log_to,
+    mark_clear,
+    mark_read,
+    mark_set,
+    mode_get,
+    mode_set,
+    need_tv,
+    say,
+    sink_mute,
+    sink_muted,
+    splash_windows,
+    tv_alive,
+    user_env,
+    user_uid,
+    window_title,
+    xdo,
+)
 
-STB_HOME = stbconf.get("STB_HOME", "/home/stbuser")
-STB_USER = stbconf.get("STB_USER", "stbuser")
-TV = stbconf.get("TV_IP", "")
-TV_PORT = stbconf.get("TV_PORT", "3000")
 TV_MAC = stbconf.get("TV_MAC", "")
 TV_IF = stbconf.get("TV_IF", "enp0s25")
 TV_INPUT = stbconf.get("TV_INPUT_ID", "")
@@ -44,44 +76,12 @@ TV_APP = stbconf.get("TV_APP_ID", "")
 TV_LIVE = stbconf.get("TV_LIVE_APP", "com.webos.app.livetv")
 TV_SPEAKER = stbconf.get("TV_SPEAKER", "")
 TV_SPEAKERS = stbconf.get("TV_SPEAKERS", "")
-MODE_FILE = "/run/stb/mode"
-SCREEN_FLAG = "/run/stb/screensaver"
-LOGS = {
-    "tv": "/var/log/stb/tv.log",
-    "system": "/var/log/stb/system.log",
-    "keys": "/var/log/stb/keys.log",
-    "idle": "/var/log/stb/idle.log",
-    "pair": "/var/log/stb/pair.log",
-    "audio": "/var/log/stb/audio.log",
-}
 
 
-def mark_set(path, value=""):
-    """Поставить отметку: файл с необязательным содержимым. False — не удалось."""
-    try:
-        with open(path, "w", encoding="utf-8") as f:
-            f.write(value)
-        return True
-    except OSError:
-        return False
 
 
-def mark_clear(*paths):
-    """Снять отметки. Отсутствие файла ошибкой не считается."""
-    for path in paths:
-        try:
-            os.remove(path)
-        except OSError:
-            pass
 
 
-def mark_read(path, default=""):
-    """Содержимое отметки или значение по умолчанию."""
-    try:
-        with open(path, encoding="utf-8") as f:
-            return f.read().strip() or default
-    except OSError:
-        return default
 
 
 def mark_age(path):
@@ -92,49 +92,14 @@ def mark_age(path):
         return None
 
 
-def log_to(section, msg, echo=False):
-    """Строка в журнал раздела.
-
-    Формат: «дата время.мс [режим] текст». Миллисекунды и режим пишутся только
-    в keys.log — по нему меряют темп двойных нажатий; остальные разделы
-    обходятся секундами. Возвращает записанную строку.
-    """
-    stamp = time.strftime("%F %T")
-    if section == "keys":
-        stamp = "%s.%03d [%s]" % (stamp, int(time.time() * 1000) % 1000, mode_get())
-    line = "%s %s" % (stamp, msg)
-    try:
-        with open(LOGS[section], "a", buffering=1, encoding="utf-8") as f:
-            f.write(line + "\n")
-    except (OSError, KeyError):
-        pass
-    if echo:
-        print(line, flush=True)
-    return line
-TVCTL = os.path.join(STB_HOME, "tvctl")
-# ключ доступа обязателен: без него библиотека считает приставку новой
-# и уходит регистрироваться — из-под root это выглядело как зависание
-CLI = [os.path.join(TVCTL, "bin", "bscpylgtvcommand"),
-       "-m", os.path.join(TVCTL, "nuc_manifest.json"),
-       "-p", os.path.join(STB_HOME, ".aiopylgtv.sqlite")]
-PY = os.path.join(TVCTL, "bin", "python")
 
 
-def say(msg):
-    """Короткая отметка о действии приставки — в журнал телевизора."""
-    log_to("tv", msg)
 
 
-def daemon():
-    return TvDaemon()
 
 
 # ═══════════════════════════════════════════════════════════ общие помощники сессии
 
-def user_uid():
-    """UID пользователя приставки — один источник для всех, кому он нужен."""
-    import pwd
-    return pwd.getpwnam(STB_USER).pw_uid
 
 
 def user_gid():
@@ -142,57 +107,16 @@ def user_gid():
     return pwd.getpwnam(STB_USER).pw_gid
 
 
-def user_env():
-    uid = user_uid()
-    return dict(os.environ, HOME=STB_HOME, DISPLAY=":0",
-                XAUTHORITY=os.path.join(STB_HOME, ".Xauthority"),
-                XDG_RUNTIME_DIR="/run/user/%d" % uid,
-                DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/%d/bus" % uid)
 
 
-def as_user(*args, **kwargs):
-    """Выполнить от имени пользователя приставки (если мы root)."""
-    if os.getuid() == 0:
-        return subprocess.run(["sudo", "-n", "-u", STB_USER, "env"] +
-                              ["%s=%s" % (k, v) for k, v in user_env().items()
-                               if k in ("HOME", "DISPLAY", "XAUTHORITY", "XDG_RUNTIME_DIR",
-                                        "DBUS_SESSION_BUS_ADDRESS")] + list(args),
-                              capture_output=True, text=True, timeout=kwargs.get("timeout", 40))
-    return subprocess.run(list(args), env=user_env(),
-                          capture_output=True, text=True, timeout=kwargs.get("timeout", 40))
 
 
 # ═══════════════════════════════════════════════════════════ телевизор
 
-def tv_alive():
-    import socket
-    try:
-        with socket.create_connection((TV, int(TV_PORT)), timeout=1):
-            return True
-    except OSError:
-        return False
 
 
-def need_tv():
-    if not tv_alive():
-        print("телевизор %s не отвечает (выключен или потерял сеть)" % TV, file=sys.stderr)
-        sys.exit(1)
 
 
-def cli_call(*args, timeout=12):
-    """Прямой вызов библиотеки телевизора. Недоступна — пустой ответ, без падения."""
-    env = dict(os.environ, HOME=STB_HOME)
-    try:
-        # cwd важен: sqlitedict открывает ключ телевизора относительно каталога,
-        # и из недоступного каталога падает «unable to open database file».
-        return subprocess.run(CLI + [TV] + list(args), capture_output=True, cwd=STB_HOME,
-                              text=True, timeout=timeout, env=env)
-    except subprocess.TimeoutExpired:
-        print("телевизор не ответил за %d с" % timeout, file=sys.stderr)
-        return subprocess.CompletedProcess(CLI, 1, stdout="", stderr="timeout")
-    except (OSError, subprocess.SubprocessError) as exc:
-        print("библиотека телевизора недоступна: %s" % exc, file=sys.stderr)
-        return subprocess.CompletedProcess(CLI, 1, stdout="", stderr=str(exc))
 
 
 def daemon_alive():
@@ -386,21 +310,8 @@ def show_apps():
 
 # ═══════════════════════════════════════════════════════════ режимы
 
-def mode_get():
-    """Режим пульта: «nuc» — управляем приставкой, «tv» — телевизором."""
-    return mark_read(MODE_FILE, "nuc")
 
 
-def mode_set(new):
-    """Переключить режим пульта: в режиме приставки работает заставка."""
-    os.makedirs(os.path.dirname(MODE_FILE), exist_ok=True)
-    mark_set(MODE_FILE, new + "\n")
-    try:
-        with open(SCREEN_FLAG, "w", encoding="utf-8") as f:
-            f.write("on\n" if new != "tv" else "off\n")
-    except OSError:
-        pass
-    return new
 
 
 def cmd_mode(argv):
@@ -420,6 +331,9 @@ def cmd_box(argv):
     if TV_INPUT:
         cmd_tv(["setinput", TV_INPUT])
     mode_set("nuc")
+    # На экране будет сетка: звук приставки глушим. Иначе спрятанный плеер
+    # продолжает играть, и после «Телевизора» фильм слышно поверх сетки.
+    sink_mute(True)
     print("приставка")
     return 0
 
@@ -592,12 +506,6 @@ def cmd_tv_learn(argv):
     return 0
 
 
-def current_app():
-    """Что сейчас на экране телевизора, одной строкой."""
-    app = daemon().state().get("app")
-    if app:
-        return str(app)
-    return cli_call("get_current_app").stdout.strip().splitlines()[-1] if tv_alive() else ""
 
 
 def cmd_boot(argv):
@@ -620,7 +528,7 @@ def cmd_boot(argv):
         cmd_tv(["setinput", TV_INPUT])
         say("boot: вход переключён на %s" % TV_INPUT)
     mode_set("nuc")
-    subprocess.run(["/opt/stb/bin/stb-idle", "on"], capture_output=True, timeout=60)
+    subprocess.run([sys.argv[0], "idle", "on"], capture_output=True, timeout=60)
     close_splash_now()
     return 0
 
@@ -632,14 +540,24 @@ def cmd_tv_shutdown(argv):
     if "reboot.target" in jobs:
         say("shutdown: перезагрузка — телевизор не гашу")
         return 0
+    mark = "/run/stb/keep-tv"
+    if os.path.exists(mark):
+        try:
+            os.remove(mark)
+        except OSError:
+            pass
+        say("shutdown: просили оставить телевизор включённым")
+        return 0
     if not tv_alive():
         say("shutdown: телевизор уже не в сети")
         return 0
-    if mode_get() == "nuc":
-        if cmd_tv(["off"]) == 0:
-            say("shutdown: телевизор погашен")
+    # Гасим всегда, каким бы путём ни выключали (кнопка корпуса, shutdown -h,
+    # плитка), и обязательно ждём, пока телевизор уйдёт в ожидание: работающий
+    # телевизор поднимает приставку обратно через WoL, и выходит перезапуск.
+    if power_off_tv():
+        say("shutdown: телевизор погашен и подтвердил ожидание")
     else:
-        say("shutdown: режим tv — телевизор оставляю включённым")
+        say("shutdown: телевизор не подтвердил выключение")
     return 0
 
 
@@ -724,25 +642,40 @@ def cmd_tv_text(argv):
             manifest_file_path=os.path.join(TVCTL, "nuc_manifest.json"), states=[])
         await client.connect()
         try:
+            # URI без схемы: bscpylgtv сам подставляет "ssap://". Полный
+            # "luna://com.webos.service.ime/..." превращался на проводе в
+            # "ssap://luna://..." и телевизор отвечал 404 — из-за этого мы
+            # решили, что службы ввода нет. Она есть и работает по сети.
+            replies = []
             if delete:
-                await asyncio.wait_for(client.request(
-                    "luna://com.webos.service.ime/deleteCharacters", {"count": int(delete)}), 10)
+                replies.append(("deleteCharacters", await asyncio.wait_for(
+                    client.request("com.webos.service.ime/deleteCharacters",
+                                   {"count": int(delete)}), 10)))
             if text:
-                await asyncio.wait_for(client.request(
-                    "luna://com.webos.service.ime/insertText", {"text": text, "replace": 0}), 10)
+                replies.append(("insertText", await asyncio.wait_for(
+                    client.request("com.webos.service.ime/insertText",
+                                   {"text": text, "replace": 0}), 10)))
             if enter:
-                await asyncio.wait_for(client.request(
-                    "luna://com.webos.service.ime/sendEnterKey", {"text": ""}), 10)
+                replies.append(("sendEnterKey", await asyncio.wait_for(
+                    client.request("com.webos.service.ime/sendEnterKey"), 10)))
+            return replies
         finally:
             # disconnect(), а не close(): close() — это медиакоманда и
             # закрывала плеер на телевизоре вместо соединения.
             await client.disconnect()
 
     try:
-        asyncio.run(send())
+        replies = asyncio.run(send())
     except Exception as exc:  # noqa: BLE001
         print(json.dumps({"ok": False, "msg": repr(exc)[:200]}, ensure_ascii=False))
         return 1
+    for method, reply in replies:
+        if isinstance(reply, dict) and reply.get("returnValue") is False:
+            why = reply.get("errorText") or reply.get("errorCode") or reply
+            print(json.dumps({"ok": False,
+                              "msg": "%s: телевизор отказал — %s" % (method, why)},
+                             ensure_ascii=False))
+            return 1
     what = text or ("стереть %d" % delete if delete else "")
     print(json.dumps({"ok": True, "msg": "отправлено: %s%s" % (what, " + Enter" if enter else "")},
                      ensure_ascii=False))
@@ -772,14 +705,6 @@ def hidden_mark():
     return os.path.join(user_env()["XDG_RUNTIME_DIR"], "stb-app-hidden")
 
 
-def sink_mute(on):
-    """Заглушить или вернуть звук приставки: он уходит в телевизор по HDMI.
-
-    На сетке и в скрытом приложении звук не нужен — иначе фильм продолжает
-    играть за кадром. В системе есть wireplumber (wpctl), pactl нет.
-    """
-    as_user("wpctl", "set-mute", "@DEFAULT_AUDIO_SINK@", "1" if on else "0")
-    log_to("audio", "звук приставки %s" % ("заглушён" if on else "включён"))
 
 
 def cmd_sound(argv):
@@ -1068,9 +993,6 @@ def cmd_player(argv):
 
 # ═══════════════════════════════════════════════════════════ лёгкий режим
 
-def idle_log(msg):
-    """Лёгкий режим: общий журнал для cmd_idle и подъёма окна."""
-    log_to("idle", msg)
 
 
 def show_browser():
@@ -1291,16 +1213,24 @@ def power_off_tv(timeout=20.0):
 
 
 def do_poweroff(argv):
-    """Общая часть: погасить телевизор (если не просили иначе) и выключиться."""
-    keep_tv = "--keep-tv" in argv
+    """Выключить приставку. Телевизор гасит хук выключения (stb-tv-shutdown):
+    один механизм для кнопки корпуса, shutdown -h и плитки, с ожиданием
+    подтверждения ожидания. Здесь только выключение."""
     dry = "--dry-run" in argv
-    if not keep_tv:
-        power_off_tv()
-    else:
-        key_log("выключение: телевизор оставляю включённым")
     if dry:
         print("пробный прогон: приставка осталась включённой")
         return 0
+    # --keep-tv: телевизор оставить включённым. Отметку читает хук выключения.
+    mark = "/run/stb/keep-tv"
+    try:
+        if "--keep-tv" in argv:
+            with open(mark, "w", encoding="utf-8") as f:
+                f.write("1")
+            key_log("выключение: телевизор просили оставить включённым")
+        elif os.path.exists(mark):
+            os.remove(mark)
+    except OSError:
+        pass
     print("выключаю приставку")
     return subprocess.run(["sudo", "-n", "systemctl", "poweroff"]).returncode
 
@@ -1324,15 +1254,11 @@ def cmd_poweroff(argv):
     except OSError:
         print("не смог поставить отметку в /run/stb", file=sys.stderr)
         return 1
-    print("нажми ещё раз в течение 10 секунд, чтобы выключить приставку")
-    print("телевизор при этом остаётся включённым")
+    print("нажми ещё раз в течение 10 секунд, чтобы выключить приставку "
+          "(телевизор погаснет вместе с ней)")
     return 0
 
 
-def splash_windows():
-    """Окна с чёрной заставкой (это вкладка в окне Firefox, не отдельное окно)."""
-    out = as_user("xdotool", "search", "--name", "Заставка").stdout.split()
-    return [w for w in out if w.isdigit()]
 
 
 def grid_window():
@@ -1503,6 +1429,31 @@ def keep_display_awake():
     as_user("xset", "s", "off")
 
 
+def watching():
+    """Человек смотрит, а не простаивает: виден плеер или открыт сайт.
+
+    Простой считается только на сетке и в пустом браузере. Иначе поверх фильма
+    открывалась чёрная вкладка (порог 5 минут), а через 10 минут гас телевизор:
+    смотреть кино было невозможно.
+    """
+    env = user_env()
+    try:
+        if jelly_windows(env):
+            return True
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        for wid in firefox_windows(env):
+            title = as_user("xdotool", "getwindowname", wid).stdout
+            if title and not is_grid(title) and "Заставка" not in title:
+                return True
+    except Exception:  # noqa: BLE001
+        pass
+    return False
+
+
+
+
 def cmd_screensaver(argv):
     """Сторож простоя: чёрная вкладка, затем гашение телевизора."""
     if argv and argv[0] == "close":
@@ -1533,6 +1484,7 @@ def cmd_screensaver(argv):
     log("сторож заставки: порог %d мин" % minutes)
 
     tick = 0
+    watching_until = 0.0
     while True:
         screen = mark_read(SCREEN_FLAG, "on")
         own = tv_shows_own_app()
@@ -1549,7 +1501,24 @@ def cmd_screensaver(argv):
             time.sleep(5)
             continue
 
+        # Сетка на экране — приставка заглушена. Правило безусловное: неважно,
+        # каким путём человек вернулся на сетку, звук не останется включённым.
+        if mode_get() == "nuc" and not sink_muted() and is_grid(window_title()):
+            sink_mute(True)
+
+        # Кино или открытый сайт — это не простой. Заставку, если она успела
+        # открыться, закрываем: фильм важнее.
+        if watching():
+            watching_until = time.monotonic()
+            if os.path.exists(opened_at):
+                close_splash_now()
+            time.sleep(5)
+            continue
+
         idle = idle_ms_capped(runtime)
+        if watching_until:
+            # xprintidle помнит всё время фильма; отсчёт ведём от конца просмотра.
+            idle = min(idle, int((time.monotonic() - watching_until) * 1000))
 
         if os.path.exists(opened_at):
             age = mark_age(opened_at) or 0
@@ -1587,54 +1556,25 @@ def cmd_screensaver(argv):
 XDISPLAY = {"DISPLAY": ":0"}
 
 
-def key_log(msg):
-    """Кнопка пульта в keys.log; последняя строка доступна через /run/stb/lastkey."""
-    line = log_to("keys", msg)
-    try:
-        with open("/run/stb/lastkey", "w", encoding="utf-8") as f:
-            f.write(line)
-    except OSError:
-        pass
 
 
-def xdo(*args):
-    """xdotool от имени пользователя приставки: окна, ввод, клики."""
-    return as_user("xdotool", *args, timeout=20)
 
 
-def window_title():
-    return xdo("getactivewindow", "getwindowname").stdout.strip()
 
 
-GRID_TITLE = "Приставка"
 
 
-BROWSER_TITLE = "Mozilla"
 
 
 BROWSER_WINDOW = "Mozilla Firefox"    # имя окна для wmctrl -a
 
 
-def is_grid(title=None):
-    """Активное окно — наша сетка."""
-    return GRID_TITLE in (window_title() if title is None else title)
 
 
-def is_browser(title=None):
-    """Активное окно — браузер: в нём живёт и сетка, и сайты во вкладках."""
-    return BROWSER_TITLE in (window_title() if title is None else title)
 
 
-def is_ours(title=None):
-    """Окно наше: сетка или браузер с вкладками."""
-    text = window_title() if title is None else title
-    return GRID_TITLE in text or BROWSER_TITLE in text
 
 
-def is_app(title=None):
-    """Окно приложения (Jellyfin и подобные): заголовок есть и он не наш."""
-    text = window_title() if title is None else title
-    return bool(text) and not is_ours(text)
 
 
 def scroll_key(grid_key, scroll):
@@ -1922,6 +1862,8 @@ def cmd_key(argv):
         if TV_INPUT:
             cmd_tv(["setinput", TV_INPUT])
         mode_set("nuc")
+        # Та же причина, что и в cmd_box: на экране сетка — звук не нужен.
+        sink_mute(True)
         as_user("wmctrl", "-a", BROWSER_WINDOW)
         return 0
 
@@ -2353,11 +2295,15 @@ def cmd_session(argv):
             pass
 
     log("сессия: старт")
+    # Частоту задаём сами: без --rate xrandr берёт самую быструю из EDID, а
+    # 1080p120 на этом телевизоре держится нестабильно (HPD-всплески и провалы
+    # картинки во время фильма).
+    rate = str(stbconf.get("DISPLAY_RATE", "60") or "60")
     out = subprocess.run(["xrandr"], env=env, capture_output=True, text=True).stdout
     for line in out.splitlines():
         if " connected" in line:
-            subprocess.run(["xrandr", "--output", line.split()[0], "--mode", "1920x1080"],
-                           env=env, capture_output=True)
+            subprocess.run(["xrandr", "--output", line.split()[0], "--mode", "1920x1080",
+                            "--rate", rate], env=env, capture_output=True)
             break
     subprocess.run(["xset", "-dpms", "s", "off"], env=env, capture_output=True)
     subprocess.run(["xset", "s", "off"], env=env, capture_output=True)

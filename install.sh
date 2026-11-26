@@ -29,7 +29,7 @@ if [ "${1:-}" = "--check" ]; then
     echo "== проверка архива (ничего не меняем) =="
     problems=0
     need="bin/stb bin/stb-watch bin/stb-wifi-remote bin/stb-tv-link \
-lib/stbtv.py lib/stbgesture.py lib/stbtvlast.py lib/stbx11.py lib/stbconf.py lib/stbconf.sh \
+lib/stbcommon.py lib/stbtv.py lib/stbgesture.py lib/stbtvlast.py lib/stbx11.py lib/stbconf.py lib/stbconf.sh \
 lib/stbkeys.py lib/stbpointer.py lib/stbtext.py lib/stbws.py lib/tv_setting.py \
 web/index.html web/stb-web.py config/stb.conf config/tiles.json \
 README.md tests/run_tests.sh tests/test_docs.py \
@@ -369,8 +369,11 @@ systemctl daemon-reload
 systemctl mask sleep.target suspend.target hibernate.target hybrid-sleep.target
 install -d -m 775 -o "$STB_USER" -g "$STB_USER" /var/log/stb
 chown -R "$STB_USER:$STB_USER" /var/log/stb
-systemctl enable stb.target stb-nic-watch.timer
-ok "stb.target и сторож сети включены"
+# Хук выключения включаем явно, а не только через Wants= у stb.target: если
+# stb.target не поднимется, приставка останется без гашения телевизора на
+# выключении — а это ровно тот случай, когда телевизор будит её обратно.
+systemctl enable stb.target stb-nic-watch.timer stb-tv-shutdown.service
+ok "stb.target, сторож сети и хук выключения включены"
 
 # Включить мало: на свежей системе службы ещё ни разу не запускались.
 # Графическая сессия тоже должна подниматься сама.
@@ -417,6 +420,7 @@ check "юнит заставки (пользователь)" test -f "$STB_HOME/
 check "профиль браузера"           test -f "$STB_HOME/.mozilla/stb/user.js"
 check "библиотека телевизора"      "$STB_HOME/tvctl/bin/python" -c "import bscpylgtv"
 check "stb.target включён"         systemctl is-enabled stb.target
+check "хук выключения включён"    systemctl is-enabled stb-tv-shutdown.service
 check "графическая цель"          test "$(systemctl get-default)" = graphical.target
 check "сторож работает"           systemctl is-active stb-watch
 check "приёмник пульта работает"  systemctl is-active stb-wifi-remote

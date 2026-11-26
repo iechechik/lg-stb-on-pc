@@ -10,10 +10,6 @@ import pytest
 ROOT = os.environ.get("STB_ROOT", "/opt/stb")
 
 
-
-ROOT = os.environ.get("STB_ROOT", "/opt/stb")
-
-
 @pytest.fixture(scope="module")
 def watch():
     loader = importlib.machinery.SourceFileLoader("stbwatch", os.path.join(ROOT, "bin/stb-watch"))

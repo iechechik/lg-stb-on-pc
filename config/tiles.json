@@ -20,7 +20,7 @@
   {
     "id": "tv-mode",
     "label": "Телевизор",
-    "sub": "эфир ТВ и пульт в ТВ",
+    "sub": "что смотрели последним, и пульт в ТВ",
     "icon": "📺",
     "img": "icons/television.png",
     "type": "command",
@@ -41,7 +41,7 @@
     "icon": "🗂",
     "img": "icons/sonarr.png",
     "type": "url",
-    "target": "http://misc.local:9095"
+    "target": "http://misc.chech:9095"
   },
   {
     "id": "radarr",
@@ -50,7 +50,7 @@
     "icon": "🎞",
     "img": "icons/radarr.png",
     "type": "url",
-    "target": "http://misc.local:9094"
+    "target": "http://misc.chech:9094"
   },
   {
     "id": "seerr",
@@ -59,7 +59,7 @@
     "icon": "🔎",
     "img": "icons/seerr.png",
     "type": "url",
-    "target": "http://misc.local:9099"
+    "target": "http://misc.chech:9099"
   },
   {
     "id": "prowlarr",
@@ -68,7 +68,7 @@
     "icon": "🎞",
     "img": "icons/prowlarr.png",
     "type": "url",
-    "target": "http://misc.local:9094"
+    "target": "http://misc.chech:9094"
   },
   {
     "id": "browser",
@@ -86,7 +86,7 @@
     "icon": "🎞",
     "img": "icons/filebrowser.png",
     "type": "url",
-    "target": "http://misc.local:8080"
+    "target": "http://misc.chech:8080"
   },
   {
     "id": "pair-remote",

@@ -29,8 +29,9 @@ def logs(cli, tmp_path, monkeypatch):
     paths = {}
     for section in ("keys", "tv", "system", "idle", "pair", "audio"):
         paths[section] = str(tmp_path / ("%s.log" % section))
-    monkeypatch.setattr(cli, "LOGS", paths, raising=False)
-    monkeypatch.setattr(cli, "mode_get", lambda: "nuc")
+    import stbcommon  # после загрузки cli каталог lib уже в sys.path
+    monkeypatch.setattr(stbcommon, "LOGS", paths)
+    monkeypatch.setattr(stbcommon, "mode_get", lambda: "nuc")
     return paths
 
 

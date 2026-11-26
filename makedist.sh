@@ -18,7 +18,7 @@ set -eu
 ROOT=/opt/stb
 USER_NAME="${STB_USER:-stbuser}"
 USER_HOME="$(getent passwd "$USER_NAME" | cut -d: -f6)"
-MISC_HOST="${STB_MISC:-hermes@misc.local}"
+MISC_HOST="${STB_MISC:-hermes@misc.chech}"
 MISC_DIR="${STB_MISC_DIR:-/home/hermes}"
 WITH_KEY=0
 RUN_TESTS=1

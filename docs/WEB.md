@@ -19,7 +19,7 @@
   "icon": "🗂",                          ← эмодзи-запасной, если нет картинки
   "img": "icons/sonarr.png",             ← картинка из /opt/stb/web/icons/
   "type": "url",                         ← "url" (открыть адрес) или "command" (выполнить)
-  "target": "http://misc.local:9095"     ← адрес или команда
+  "target": "http://misc.chech:9095"     ← адрес или команда
 }
 ```
 

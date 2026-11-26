@@ -133,13 +133,24 @@ fetch('/api/buttons').then(r => r.json()).then(list => {
     const idx = list.indexOf(b);
     // Наведение курсором = выбор этой плитки: стрелки продолжают с неё,
     // и подсветка одна, а не две разные.
-    a.addEventListener('mouseenter', () => selectTile(idx));
+    // Правило одно: подсветка всегда там, где курсор. Ведёшь мышью — выбирается
+    // плитка под курсором; идёшь стрелками — курсор переставляется на выбранную
+    // (см. moveSelection). Расходятся они только на эхо переставленного курсора.
+    a.addEventListener('mouseenter', () => {
+      if (Date.now() < warpUntil) return;
+      selectTile(idx);
+    });
+    a.addEventListener('focus', () => { if (sel !== idx) selectTile(idx); });
     grid.appendChild(a);
   }
   fitTiles(list.length);
-  // после отрисовки выбор = плитка под курсором (иначе первая стрелка
-  // прыгала на первую плитку, хотя курсор стоял на другой)
-  selectTile(tileUnderPointer());
+  // Выбор сохраняем, если плитка ещё на месте. Раньше здесь всегда бралась
+  // плитка под курсором: раз в минуту подсветка прыгала, а после возврата из
+  // приложения вставала не туда, куда человек шёл.
+  selectTile(sel >= 0 && sel < list.length ? sel : 0);
+  // Один раз после загрузки ставим курсор на выбранную плитку: правило
+  // «подсветка там, где курсор» должно выполняться и на старте.
+  if (!warpedOnce) { warpedOnce = true; moveSelection(0); }
 }).catch(e => status('не загрузились кнопки: ' + e));
 }
 render();
@@ -173,7 +184,11 @@ function fitTiles(count) {
 
 
 // ---- Навигация стрелками по сетке (стрелки приходят с пульта) --------------
-let sel = -1;
+let warpUntil = 0;
+// При загрузке страницы выбор всегда на первой плитке: возврат из приложения
+// страницу не перезагружает, поэтому прежний выбор и так сохраняется.
+let sel = 0;
+let warpedOnce = false;   // курсор наводим на выбранную один раз, при загрузке
 
 // Сколько сейчас столбцов в сетке (верстка задаёт это в CSS).
 function gridColumns() {
@@ -201,6 +216,7 @@ function selectTile(i) {
   const t = tiles();
   if (!t.length || i < 0 || i >= t.length) return;
   sel = i;
+  try { localStorage.setItem('stb-sel', String(sel)); } catch (e) {}
   t.forEach((x, n) => x.classList.toggle('sel', n === sel));
   t[sel].focus();
   const r = t[sel].getBoundingClientRect();
@@ -228,6 +244,10 @@ function moveSelection(step) {
   ptrX = r.left + r.width / 2;
   ptrY = r.top + r.height / 2;
   ptrSeen = true;
+  // Настоящий курсор переставляем на выбранную плитку: иначе стрелки двигают
+  // подсветку, а указатель остаётся на прежней и «перетягивает» выбор на себя.
+  warpUntil = Date.now() + 400;
+  fetch('/pointer/warp?x=' + Math.round(ptrX) + '&y=' + Math.round(ptrY)).catch(() => {});
 }
 // ---- Подтверждение опасных плиток (confirm: true в tiles.json)
 const confirmEl = document.getElementById('confirm');

@@ -3,6 +3,7 @@ Description=STB web (сетка + переходник команд)
 After=graphical-session.target
 
 [Service]
+Environment=DISPLAY=:0
 Type=simple
 WorkingDirectory=/opt/stb/web
 ExecStart=/usr/bin/python3 /opt/stb/web/stb-web.py

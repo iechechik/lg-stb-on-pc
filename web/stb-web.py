@@ -206,6 +206,12 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(data)
 
+    def end_headers(self):
+        # Страница и плитки меняются на ходу: без этого браузер держит старую
+        # версию и правки «не доезжают» до экрана.
+        self.send_header("Cache-Control", "no-store, must-revalidate")
+        super().end_headers()
+
     def _json(self, code, obj):
         self._send(code, json.dumps(obj, ensure_ascii=False))
 
@@ -290,6 +296,22 @@ class Handler(BaseHTTPRequestHandler):
                                  or b.get("show", True)])
             except Exception as e:  # noqa: BLE001
                 self._json(500, {"ok": False, "msg": str(e)})
+        elif path == "/pointer/warp":
+            # Стрелки двигают выбор; курсор ставим на ту же плитку, иначе
+            # подсветка и настоящий курсор живут отдельно и «прыгают».
+            query = parse_qs(urlparse(self.path).query)
+            try:
+                x = int(float(query.get("x", [""])[0]))
+                y = int(float(query.get("y", [""])[0]))
+            except (TypeError, ValueError):
+                self._json(400, {"ok": False, "msg": "нужны x и y"})
+            else:
+                r = subprocess.run(["xdotool", "mousemove", "--sync", str(x), str(y)],
+                                   capture_output=True, timeout=5, text=True)
+                if r.returncode:
+                    self._json(500, {"ok": False, "msg": (r.stderr or "").strip()[:200]})
+                else:
+                    self._json(200, {"ok": True})
         elif path == "/sound/on":
             # Плитки-сайты открываются ссылкой: страница просит включить звук,
             # прежде чем уйти на YouTube и подобное. Сетка звук глушит.

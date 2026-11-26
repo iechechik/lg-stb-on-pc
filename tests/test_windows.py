@@ -52,5 +52,6 @@ def test_app_is_everything_else_with_title(cli):
 
 def test_titles_are_single_source(cli):
     """Заголовки заданы константами, а не рассыпаны строками по коду."""
+    import stbcommon
     assert cli.GRID_TITLE == "Приставка"
-    assert cli.BROWSER_TITLE == "Mozilla"
+    assert stbcommon.BROWSER_TITLE == "Mozilla"
