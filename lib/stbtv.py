@@ -143,5 +143,13 @@ class TvDaemon:
     async def vol(self, direction):
         return await self.aask({"cmd": "vol", "dir": direction})
 
+    async def shot(self):
+        """Кадр экрана телевизора: доля изменений и что за приложение."""
+        return await self.aask({"cmd": "shot"}, timeout=20)
+
+    async def screen(self, on=True):
+        """Погасить или включить панель телевизора (он остаётся включённым)."""
+        return await self.aask({"cmd": "screen", "on": bool(on)}, timeout=10)
+
     async def speaker(self, name):
         return await self.aask({"cmd": "speaker", "id": name})

@@ -3,15 +3,26 @@
    не показываются. Открылся сайт (вкладок стало две) — всё возвращается.
    Механизм: :has() поддерживается начиная с Firefox 121. */
 
-:root:has(#tabbrowser-tabs .tabbrowser-tab:only-of-type) #TabsToolbar,
-:root:has(#tabbrowser-tabs .tabbrowser-tab:only-of-type) #nav-bar {
+/* Верхние строки (вкладки и адрес) скрыты всегда: на телевизоре они не нужны,
+   а главное — при скрытой адресной строке Tab не уходит из страницы в chrome,
+   и в формах фокус ходит только по полям. */
+:root[stb-grid] #TabsToolbar,
+:root[stb-grid] #nav-bar {
   visibility: collapse !important;
 }
 
-/* Пока верхние строки скрыты, окно не должно прыгать по высоте. */
-:root:has(#tabbrowser-tabs .tabbrowser-tab:only-of-type) #navigator-toolbox {
+#navigator-toolbox {
   border-bottom: none !important;
 }
 
 /* Подсказка адреса внизу — лишняя на телевизоре. */
 #statuspanel { display: none !important; }
+
+/* Панель «This connection is not secure. Logins entered here could be
+   compromised» перекрывает поле пароля на http-страницах (Sonarr, Radarr и
+   прочие локальные службы). Строку добавляет менеджер паролей безусловно,
+   если соединение не защищено (LoginAutoComplete.sys.mjs), и настройками она
+   не выключается — убираем её оформлением профиля. */
+#PopupAutoComplete richlistitem[originaltype="insecureWarning"] {
+  display: none !important;
+}

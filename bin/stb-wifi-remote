@@ -34,7 +34,6 @@ sys.path.insert(0, "/opt/stb/lib")
 
 
 import glob as _glob
-_HOME = STB_HOME
 for _p in _glob.glob(os.path.join(STB_HOME, "tvctl", "lib", "python3*", "site-packages")):
     sys.path.insert(0, _p)
 
@@ -42,8 +41,6 @@ LAN_IP = os.environ.get("FAKETV_IP") or stbconf.own_ip()
 PORT = int(os.environ.get("FAKETV_PORT") or stbconf.get("WF_PORT", "3000"))
 LOG = os.environ.get("FAKETV_LOG") or "/var/log/stb/faketv.log"
 MODE_FILE = "/run/stb/mode"
-KEY_FILE = f"{STB_HOME}/.aiopylgtv.sqlite"
-MANIFEST = f"{STB_HOME}/tvctl/nuc_manifest.json"
 TV_IP = os.environ.get("TV_IP") or stbconf.get("TV_IP", "")
 SEND_HZ = 25
 
@@ -247,6 +244,18 @@ def should_use_cli(resp):
             and not daemon_alive())
 
 
+def screensaver_present():
+    """Погашен ли экран: наш чёрный экран или панель телевизора."""
+    runtime = os.environ.get("XDG_RUNTIME_DIR", "/run/user/1000")
+    return (os.path.exists(os.path.join(runtime, "stb-screenblank"))
+            or os.path.exists(os.path.join(runtime, "stb-tv-blanked")))
+
+
+async def close_screensaver():
+    """Снять заставку: возвращаем яркость и панель, отметки убираются."""
+    await arun(["/opt/stb/bin/stb", "screensaver", "close"])
+
+
 async def do_action(name):
     name = (name or "").strip()
     if not name:
@@ -357,7 +366,6 @@ CLICK_GAP = float(stbconf.get("CLICK_GAP", "0.35"))
 DUP_GAP = float(stbconf.get("DUP_GAP", "0.1"))
 RAW_LOG = str(stbconf.get("STB_LOG_RAW", "0")).strip() in ("1", "on", "true", "yes")
 LAST_PRESS = {}
-LAST_CLICK = [0.0]
 
 # ---- объекты
 X11 = open_pointer()   # указатель на самом экране (XTest); None — тогда xdotool
@@ -532,6 +540,16 @@ async def handle(reader, writer):
         if RAW_LOG:
             w("RAW: " + text.replace(chr(10), " | ")[:200])
 
+        # Заставка на экране: первый жест только снимает её. Ни кнопка, ни
+        # клик, ни прокрутка не должны попасть в приложение — иначе нажатие,
+        # которым человек будит экран, ещё и что-то нажимает. Ровно как у
+        # телевизора. В режиме ТВ наши кнопки уходят в ТВ, и без этого
+        # перехвата простой нашего X даже не изменился бы.
+        if screensaver_present():
+            await close_screensaver()
+            w("    заставка снята — жест не передаю")
+            continue
+
         # ---- события указателя
         if text.startswith("type:move"):
             PTR.add(field(text, "dx"), field(text, "dy"))
@@ -627,8 +645,11 @@ async def handle(reader, writer):
             if mode() == "tv":
                 await arun(["/opt/stb/bin/stb", "tv", "text", "--enter"])
             else:
+                # ⏎ на клавиатуре телефона — это отправка: человек набрал пароль и
+                # жмёт ввод, форма уходит. Переход между полями делается кликом
+                # (плей/пауза), поэтому Tab тут не нужен.
                 await arun(["xdotool", "key", "--clearmodifiers", "Return"])
-            w(f"ВВОД: Enter (режим {mode()})")
+            w(f"ВВОД: ⏎ → отправка (режим {mode()})")
             writer.write(ws_frame(ssap_reply(mid, {"returnValue": True})))
             await writer.drain()
         elif "ime/deleteCharacters" in uri:

@@ -42,6 +42,7 @@
             font-size: 26px; opacity: 0; transition: opacity .2s; pointer-events: none; }
   #status.show { opacity: 1; }
 
+
   a.tile.sel, a.tile:focus {
     outline: 4px solid #8ad6a0;
     outline-offset: 4px;
@@ -70,7 +71,7 @@
     <h2 id="confirm-title">Выключить?</h2>
     <div class="row">
       <button id="confirm-no" type="button">Отмена</button>
-      <button id="confirm-yes" class="danger" type="button">Выключить</button>
+      <button id="confirm-yes" class="danger" type="button">Да</button>
     </div>
   </div>
 </div>
@@ -109,6 +110,8 @@ fetch('/api/buttons').then(r => r.json()).then(list => {
   for (const b of list) {
     const a = document.createElement('a');
     a.className = 'tile';
+    // id плитки: по нему возвращаем курсор туда, откуда человек ушёл.
+    a.dataset.id = b.id;
     a.href = b.type === 'url' ? b.target : '#';
     // Ссылка открывается в новой вкладке: сетка остаётся первой вкладкой,
     // к ней возвращаются кликом по вкладке или кнопкой Home.
@@ -119,9 +122,17 @@ fetch('/api/buttons').then(r => r.json()).then(list => {
     a.innerHTML = '<div class="ico">' + ico + '</div>' +
                   '<div class="lbl">' + b.label + '</div>' +
                   (b.sub ? '<div class="sub">' + b.sub + '</div>' : '');
+    // Какую плитку открыли — помним: при возврате на сетку курсор встанет на неё.
+    a.addEventListener('click', () => {
+      try { localStorage.setItem('stb-last-tile', b.id); } catch (e) {}
+    });
     if (b.type === 'url') {
       // Сетка глушит звук; сайт в новой вкладке должен играть.
       a.addEventListener('click', () => { fetch('/sound/on').catch(() => {}); });
+      // Плитка «Браузер» — окно, а не полный экран: нужны вкладки и адресная строка.
+      a.addEventListener('click', () => {
+        fetch('/window/windowed', {keepalive: true}).catch(() => {});
+      });
     }
     if (b.type === 'command') {
       a.addEventListener('click', ev => {
@@ -150,11 +161,26 @@ fetch('/api/buttons').then(r => r.json()).then(list => {
   selectTile(sel >= 0 && sel < list.length ? sel : 0);
   // Один раз после загрузки ставим курсор на выбранную плитку: правило
   // «подсветка там, где курсор» должно выполняться и на старте.
-  if (!warpedOnce) { warpedOnce = true; moveSelection(0); }
+  if (!warpedOnce) { warpedOnce = true; warpToSelected(); }
 }).catch(e => status('не загрузились кнопки: ' + e));
 }
 render();
 // список кнопок подхватывается сам, без перезагрузки страницы
+// Вернуть подсветку на конкретную плитку по её id — «откуда ушёл».
+window.stbSelectTile = function (id) {
+    const list = Array.from(document.querySelectorAll('#grid a[data-id]'));
+    const i = list.findIndex(a => a.dataset.id === id);
+    if (i < 0) return false;
+    selectTile(i);
+    warpToSelected();
+  return true;
+};
+// После перезапуска интерфейса курсор встаёт на первую плитку.
+window.stbResetCursor = function () {
+  selectTile(0);
+  warpToSelected();
+  return true;
+};
 setInterval(render, 60000);
 
 // Индикатор раскладки в шапке: видно всегда, без всплывающих подсказок.
@@ -185,9 +211,14 @@ function fitTiles(count) {
 
 // ---- Навигация стрелками по сетке (стрелки приходят с пульта) --------------
 let warpUntil = 0;
-// При загрузке страницы выбор всегда на первой плитке: возврат из приложения
-// страницу не перезагружает, поэтому прежний выбор и так сохраняется.
+// Выбор восстанавливаем из localStorage: возврат на сетку должен попадать на ту
+// плитку, откуда ушли. Раньше номер писался и никем не читался, поэтому вход
+// всегда был на первую плитку.
 let sel = 0;
+try {
+  const kept = parseInt(localStorage.getItem('stb-sel'), 10);
+  if (Number.isFinite(kept) && kept >= 0) sel = kept;
+} catch (e) {}
 let warpedOnce = false;   // курсор наводим на выбранную один раз, при загрузке
 
 // Сколько сейчас столбцов в сетке (верстка задаёт это в CSS).
@@ -223,6 +254,18 @@ function selectTile(i) {
   ptrX = r.left + r.width / 2;
   ptrY = r.top + r.height / 2;
   ptrSeen = true;
+}
+
+// Переставить указатель на выбранную плитку: подсветка и курсор — одно.
+function warpToSelected() {
+  const t = tiles();
+  if (!t.length || sel < 0 || sel >= t.length) return;
+  const r = t[sel].getBoundingClientRect();
+  ptrX = r.left + r.width / 2;
+  ptrY = r.top + r.height / 2;
+  ptrSeen = true;
+  warpUntil = Date.now() + 400;
+  fetch('/pointer/warp?x=' + Math.round(ptrX) + '&y=' + Math.round(ptrY)).catch(() => {});
 }
 
 function moveSelection(step) {
@@ -261,7 +304,7 @@ function paintConfirm() {
 }
 
 function askConfirm(tile) {
-  confirmState = { tile: tile, focus: 0, timer: 0, sel: sel };
+  confirmState = { tile: tile, focus: 1, timer: 0, sel: sel };  // 1 — действие
   document.body.classList.add('modal-open');
   document.getElementById('confirm-title').textContent = tile.label + '?';
   confirmEl.classList.add('show');
@@ -340,6 +383,18 @@ document.addEventListener('keydown', e => {
   tile.click();
 });
 
+// ---- Возврат в окно сетки: курсор туда, где стояли --------------------
+// Jellyfin и сайты возвращают управление на сетку, но указатель остаётся там,
+// где его бросило приложение, и первое движение перетягивало выбор на чужую
+// плитку. Возвращаем указатель к подсвеченной.
+function refocusCursor() {
+  if (confirmState) return;
+  if (sel >= 0 && sel < tiles().length) selectTile(sel);
+  warpToSelected();
+}
+window.addEventListener('focus', refocusCursor);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) refocusCursor(); });
+
 // ---- показываем, что нажато на пульте (проверка, что кнопки доходят) --------
 let lastKeyTs = 0;
 let keyTimer = null;
@@ -355,6 +410,12 @@ function pollKey() {
   }).catch(() => {});
 }
 setInterval(pollKey, 800);
+</script>
+<script>
+// Вернулись на вкладку сетки — окно снова во весь экран.
+document.addEventListener('visibilitychange', () => {
+  if (!document.hidden) fetch('/window/fullscreen', {keepalive: true}).catch(() => {});
+});
 </script>
 </body>
 </html>

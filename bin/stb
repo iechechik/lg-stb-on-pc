@@ -15,7 +15,6 @@
     stb close                закрыть активное окно (сетку не трогаем)
 
     stb key <действие>       кнопка пульта с учётом режима
-    stb lang [ru|en|toggle|status]   раскладка клавиатуры приставки
     stb ctl [status|restart|stop|start]   службы комплекса
 
 Если программу вызвать как `tv`, она делает то же, что `stb tv`:
@@ -30,12 +29,14 @@ sys.path.insert(0, "/opt/stb/lib")
 import stbconf  # noqa: E402
 from stbcommon import (STB_HOME, STB_USER, as_user, current_app, key_log,
                        log_to, mark_set, mode_set, say, tv_alive, user_env)
+from stbsvc import cmd_service  # noqa: E402
+import stb4k  # noqa: E402
+from stbdesktop import cmd_login  # noqa: E402
 from stbdesktop import close_splash_now  # noqa: E402
 from stbdesktop import cmd_browser  # noqa: E402
 from stbdesktop import cmd_box  # noqa: E402
 from stbdesktop import cmd_close  # noqa: E402
 from stbdesktop import cmd_jelly  # noqa: E402
-from stbdesktop import cmd_lang  # noqa: E402
 from stbdesktop import cmd_live  # noqa: E402
 from stbdesktop import cmd_mode  # noqa: E402
 from stbdesktop import cmd_sound  # noqa: E402
@@ -128,6 +129,31 @@ stbcommon.SELF = os.path.realpath(__file__)
 
 
 
+
+
+def _mode4k(argv):
+    """Ручной режим экрана: stb mode4k [on|off|toggle|status]."""
+    return stb4k.cmd(argv)
+
+
+def cmd_status(argv):
+    """Что сейчас с экраном и плеером: одна строка ответа на каждый вопрос."""
+    mode = stb4k.video_mode()
+    screen = stb4k.current_mode() or "неизвестно"
+    height, paused, fps = stb4k.playing()
+    if height:
+        film = "%dp" % height + (", пауза" if paused else ", играет")
+        if fps:
+            film += ", %.3f кадр/с" % float(fps)
+    else:
+        film = "нет"
+    print("экран:      %s" % screen)
+    print("4K-режим:   %s" % {"off": "off — всегда 1080p",
+                              "auto": "auto — только 4K-фильм",
+                              "all": "all — любой фильм"}[mode])
+    print("фильм:      %s" % film)
+    print("окно Jellyfin: %s" % ("активно" if stb4k.player_active() else "не активно"))
+    return 0
 
 
 def cmd_boot(argv):
@@ -749,11 +775,10 @@ def cmd_session(argv):
     for extra in ("xfce4-panel", "xfdesktop", "xfwm4", "dunst", "xbindkeys"):
         subprocess.run(["pkill", "-x", extra], capture_output=True)
 
-    try:
-        layout = open("/var/lib/stb/lang", encoding="utf-8").read().strip() or "en"
-    except OSError:
-        layout = "en"
-    subprocess.run([sys.argv[0], "lang", layout], env=env, capture_output=True)
+    # Раскладка одна и навсегда — us: приставка набирает латиницу (адреса,
+    # логины, пароли), а кириллицу браузер принимает и в us (проверено: «найди
+    # hermes» набирается верно). Переключений нет, значит и путаницы нет.
+    subprocess.run(["setxkbmap", "us"], env=env, capture_output=True)
 
     subprocess.Popen(["dunst"], env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, encoding="utf-8")
     try:
@@ -848,10 +873,12 @@ HELP = {
          " left, right, prev, next, play, playkey, pausekey, chup, chdown,"
          " red, green, yellow, blue, info, guide, cc, exit, цифры"),
     ]),
-    "lang": ("раскладка клавиатуры приставки", [
-        ("stb lang status", "какая раскладка сейчас"),
-        ("stb lang ru | en", "включить русскую или английскую"),
-        ("stb lang toggle", "переключить"),
+    "status": ("что сейчас с экраном и плеером", [
+        ("stb status", "разрешение экрана, значение JMP_VIDEO_4K, что играет"),
+    ]),
+    "mode4k": ("режим экрана 1080p / 2160p", [
+        ("stb mode4k on | off | toggle | status",
+         "вручную переключить выход: 2160p или 1080p (автопереключение при этом выключается)"),
     ]),
     "sound": ("звук приставки, а не телевизора", [
         ("stb sound on | off", "включить или заглушить звук приставки (на сетке глушится сам)"),
@@ -925,8 +952,18 @@ HELP = {
         ("stb poweroff --dry-run", "проверить порядок (телевизор гаснет, приставка остаётся)"),
         ("stb poweroff --now", "выключить сразу, без подтверждения"),
     ]),
+    "login": ("вход в локальные службы", [
+        ("stb login <плитка>", "войти в службу данными из config/logins.conf (поля находит браузер)"),
+    ]),
+    "service": ("службы комплекса", [
+        ("stb service list", "что есть и в каком состоянии (обе половины: пользовательская и системная)"),
+        ("stb login <плитка>", "войти в службу данными из config/logins.conf (поля находит браузер)"),
+        ("stb service restart <служба>", "перезапустить: сама разберётся, где живёт служба"),
+        ("stb service status <служба>", "подробное состояние одной службы"),
+        ("stb service logs <служба>", "последние строки журнала этой службы"),
+    ]),
     "screensaver": ("сторож простоя", [
-        ("stb screensaver", "сам сторож: открывает чёрную вкладку по простою и закрывает по нажатию"),
+        ("stb screensaver", "сам сторож: гасит выход по тишине и возвращает по нажатию"),
     ]),
     "help": ("эта справка", [
         ("stb help", "список разделов"),
@@ -987,12 +1024,14 @@ COMMANDS = {
     "ui": cmd_ui,
     "sound": cmd_sound,
     "hidden": lambda argv: hidden_check() if not argv or argv[0] == "check" else 2,
-    "lang": cmd_lang,
     "ctl": cmd_ctl,
     "boot": cmd_boot,
     "preflight": cmd_preflight,
     "zoom": cmd_zoom,
     "key": cmd_key,
+    "4k": _mode4k,
+    "mode4k": _mode4k,
+    "status": cmd_status,
     "help": cmd_help,
     "pair": cmd_pair,
     "keys": cmd_keys,
@@ -1002,6 +1041,8 @@ COMMANDS = {
     "session": cmd_session,
     "nic-watch": cmd_nic_watch,
     "player": cmd_player,
+    "login": cmd_login,
+    "service": cmd_service,
     "screensaver": cmd_screensaver,
     "poweroff": cmd_poweroff,
 }

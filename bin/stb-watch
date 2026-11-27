@@ -25,6 +25,10 @@ import threading
 import time
 
 sys.path.insert(0, "/opt/stb/lib")
+from stbtvcmd import power_on  # noqa: E402
+import stb4k  # noqa: E402
+import stbtabs  # noqa: E402
+from stbdesktop import hide_minutes, login_auto  # noqa: E402
 import stbconf  # noqa: E402
 from stbtv import TvDaemon  # noqa: E402
 import stbtvlast  # noqa: E402
@@ -75,6 +79,10 @@ CHECK_EVERY = 4
 WATCH_TIMEOUT = 8.0
 NEED_CONFIRM = 2          # сколько одинаковых ответов подряд, чтобы поверить
 POWEROFF_AFTER = int(stbconf.get("IDLE_POWEROFF_AFTER", "0") or 0)
+# Сколько секунд без сети и без ответа самого телевизора считаем «выключен».
+# В своём сне LG гасит Wi-Fi, и раньше двух промахов пинга хватало, чтобы
+# погасить экран — из-за этого телевизор показывал чёрное после включения.
+OFFLINE_OFF_AFTER = float(stbconf.get("TV_OFFLINE_LIMIT", "300") or 300)
 DRY = str(stbconf.get("STB_POWEROFF_DRY", "0")).strip() in ("1", "yes", "true")
 IGNORE_SSH = str(stbconf.get("STB_POWEROFF_IGNORE_SSH", "0")).strip() in ("1", "yes", "true")
 SSH_IDLE_LIMIT = int(stbconf.get("SSH_IDLE_LIMIT", "900") or 900)
@@ -122,9 +130,22 @@ def power_state():
 
 
 def tv_in_network():
-    """Отвечает ли телевизор в сети (ping): включённый LG отвечает всегда."""
+    """Есть ли телевизор в сети.
+
+    Один пакет — плохой признак: ICMP теряется на ровном месте, и телевизор
+    ложно считался выключенным (после этого гас экран). Поэтому сначала смотрим
+    таблицу соседей — она показывает, что адрес вообще живой, — а если записи
+    нет, спрашиваем тремя пакетами.
+    """
     try:
-        return subprocess.run(["ping", "-c", "1", "-W", "1", TV],
+        neigh = subprocess.run(["ip", "neigh", "show", TV],
+                               capture_output=True, text=True, timeout=3).stdout
+    except (OSError, subprocess.SubprocessError):
+        neigh = ""
+    if "lladdr" in neigh and "FAILED" not in neigh and "INCOMPLETE" not in neigh:
+        return True
+    try:
+        return subprocess.run(["ping", "-c", "3", "-i", "0.2", "-W", "1", TV],
                               capture_output=True).returncode == 0
     except (OSError, subprocess.SubprocessError):
         return False
@@ -159,10 +180,13 @@ def decide(state, age, online, last_on, misses):
     """
     stale = age is None or age > STATE_MAX_AGE
     if state and not stale:
-        return state == "Active"
+        return power_on(state)
     if online:
         return bool(last_on)
-    return False if misses >= 2 else bool(last_on)
+    # Телевизор пропал из сети — сам по себе это не признак выключения: LG в своём
+    # сне гасит Wi-Fi. Считаем выключенным только после OFFLINE_OFF_AFTER секунд
+    # молчания; до этого держим прежнее состояние и экран не трогаем.
+    return False if misses * CHECK_EVERY >= OFFLINE_OFF_AFTER else bool(last_on)
 
 
 def tv_is_on():
@@ -410,12 +434,40 @@ def watch_tv():
     next_jelly = 0.0
 
     while True:
+        # Страница входа службы — заполняем сами, не заставляя человека
+        # перебирать поля пультом.
+        try:
+            login_auto()
+        except Exception:  # noqa: BLE001
+            pass
+        # Режим выхода под содержимое: 4K-поток → 2160p, иначе 1080p.
+        try:
+            stb4k.check()
+        except Exception:  # noqa: BLE001
+            pass
+        # Верхние строки браузера: на сетке их нет, на страницах они есть.
+        try:
+            stbtabs.follow_grid_bars()
+        except Exception:  # noqa: BLE001
+            pass
+        # Брошенные вкладки: закрываем те, что не были активны дольше порога.
+        try:
+            # Вкладки живут по общему таймауту приложений: отдельного
+            # порога нет, человек задаёт одно время в APP_HIDE_MINUTES.
+            stbtabs.reap(hide_minutes())
+        except Exception:  # noqa: BLE001
+            pass
         if time.monotonic() >= next_jelly:
             next_jelly = time.monotonic() + 30
-            try:
-                jelly_misses = jelly_cleanup(jelly_misses)
-            except Exception as exc:  # noqa: BLE001
-                log("tv", "уборка плеера не удалась (%r)" % (exc,))
+            # Только при включённом телевизоре: при выключенном лишнее уже
+            # закрыто в `stb idle off`, и добивать там нечего.
+            if known:
+                try:
+                    jelly_misses = jelly_cleanup(jelly_misses)
+                except Exception as exc:  # noqa: BLE001
+                    log("tv", "уборка плеера не удалась (%r)" % (exc,))
+                    jelly_misses = 0
+            else:
                 jelly_misses = 0
         try:
             cur = tv_is_on()
@@ -491,7 +543,7 @@ def watch_audio():
     while True:
         state = daemon_ask({"cmd": "state"}).get("state") or {}
         # погашенный экран трогать нельзя: смена выхода звука будила телевизор
-        if state.get("power") == "Active":
+        if power_on(state.get("power")):
             current = state.get("sound")
             if current and current != DESIRED_SPEAKER:
                 log("audio", "выход звука был %s → возвращаю %s" % (current, DESIRED_SPEAKER))
@@ -819,7 +871,7 @@ def watch_bt_keys():
     import evdev
     from evdev import ecodes
 
-    EXTRA_KEYS.update({ecodes.KEY_APPSELECT: "layout", ecodes.KEY_CONTROLPANEL: "toggle"})
+    EXTRA_KEYS.update({ecodes.KEY_CONTROLPANEL: "toggle"})
     env = {"DISPLAY": ":0", "XAUTHORITY": os.path.join(STB_HOME, ".Xauthority"), "HOME": STB_HOME}
 
     def keyboards():
@@ -832,28 +884,6 @@ def watch_bt_keys():
             if dev.info.bustype == 0x05 and ecodes.KEY_A in dev.capabilities().get(ecodes.EV_KEY, []):
                 out.append(dev)
         return out
-
-    def current_layout():
-        try:
-            with open("/run/stb/lang", encoding="utf-8") as f:
-                return f.read().strip() or "us"
-        except OSError:
-            return "us"
-
-    def toggle_layout():
-        new = "en" if current_layout() == "ru" else "ru"
-        try:
-            subprocess.run(["/opt/stb/bin/stb", "lang", new], env=dict(os.environ, **env),
-                           timeout=8, capture_output=True)
-        except subprocess.TimeoutExpired:
-            log("bt-keys", "переключатель раскладки не ответил за 8 с")
-        log("bt-keys", "раскладка → %s" % new)
-        try:
-            with open("/run/stb/lastkey", "w", encoding="utf-8") as f:
-                f.write("%s [nuc] раскладка: %s" % (time.strftime("%F %T"),
-                                                    "РУС" if new == "ru" else "ENG"))
-        except OSError:
-            pass
 
     def toggle_tv():
         log("bt-keys", "ползунки → переключение приставка/телевизор")
@@ -879,9 +909,7 @@ def watch_bt_keys():
                 for ev in dev.read():
                     if ev.type == ecodes.EV_KEY and ev.value == 1 and ev.code in EXTRA_KEYS:
                         action = EXTRA_KEYS[ev.code]
-                        if action == "layout":
-                            toggle_layout()
-                        elif action == "toggle":
+                        if action == "toggle":
                             toggle_tv()
             except OSError:
                 devs = [x for x in devs if x.path != dev.path]

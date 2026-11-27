@@ -11,16 +11,18 @@ import time
 
 import stbcommon
 import stbconf
-from stbcommon import (STB_HOME, as_user, is_app, is_browser, is_grid, is_ours,
+from stbcommon import (STB_HOME, as_user, is_app, is_browser, is_grid,
                        key_log, mark_clear, mark_set, mode_get, mode_set,
-                       sink_mute, splash_windows, tv_alive, user_gid, user_uid,
+                       sink_mute, screensaver_on, tv_alive, user_gid, user_uid,
                        window_title, xdo)
-from stbdesktop import BROWSER_WINDOW  # noqa: E402
+import stb4k  # noqa: E402
+import stbtabs  # noqa: E402
+from stbdesktop import BROWSER_WINDOW, window_mode  # noqa: E402
 from stbcommon import STB_USER  # noqa: E402
 from stbtvcmd import TV_INPUT  # noqa: E402
 from stbtvcmd import awake  # noqa: E402
-from stbdesktop import cmd_grid  # noqa: E402
 from stbdesktop import cmd_hide  # noqa: E402
+from stbdesktop import close_splash_now  # noqa: E402
 from stbtvcmd import cmd_tv  # noqa: E402
 from stbcommon import current_app  # noqa: E402
 from stbdesktop import finish_all  # noqa: E402
@@ -64,7 +66,7 @@ def key_power():
         mark_set("/run/stb/waking")
         subprocess.Popen([stbcommon.SELF, "tv", "wake", "40"],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, encoding="utf-8")
-        if splash_windows():
+        if screensaver_on():
             subprocess.Popen([stbcommon.SELF, "screensaver", "close"],
                              stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                              encoding="utf-8")
@@ -87,7 +89,7 @@ def key_power():
     mark_set("/run/stb/waking")
     subprocess.Popen([stbcommon.SELF, "tv", "wake", "40"],
                      stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, encoding="utf-8")
-    if splash_windows():
+    if screensaver_on():
         subprocess.Popen([stbcommon.SELF, "screensaver", "close"],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, encoding="utf-8")
     return 0
@@ -112,16 +114,45 @@ def key_back():
         time.sleep(0.25)
         after = window_title()
         if before == after:
+            # Вкладку не закрываем: раньше здесь стоял ctrl+w, и серия нажатий
+            # Back вынесла все вкладки подряд. В сетку — двойной Back.
             if is_grid(after):
                 key_log("back → это сетка, назад некуда")
             else:
-                key_log("back → истории нет, закрываю вкладку")
-                xdo("key", "--clearmodifiers", "ctrl+w")
+                key_log("back → истории нет (вкладку не трогаю; двойной Back — на сетку)")
         else:
             key_log("back → шаг назад в браузере")
         return 0
     key_log("back → скрыть окно (%s)" % title)
     return cmd_hide([])
+
+
+def to_grid():
+    """Уйти на сетку: переключить её вкладку, сразу убрать полосы, поставить курсор.
+
+    Полосы убираем здесь же, а не ждём сторожа: иначе сетка пару секунд висит с
+    «грязным» верхом. Курсор ставим в центр выбранной плитки — иначе он остаётся
+    там, где был, и нажатие PAUSE попадает не туда.
+    """
+    try:
+        # Сначала вернуть 1080p, потом показать сетку: иначе сетка успевает
+        # отрисоваться в 4K и выглядит мелкой.
+        stb4k.to_hd()
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        stbtabs.activate_grid()
+        placed = stbtabs.select_tile(stbtabs.last_tile())
+        window_mode(True)      # сетка всегда во весь экран
+        stbtabs.set_grid_bars(True)
+        sink_mute(True)        # на сетке звук всегда выключен
+        if not placed:
+            # Страница не ответила — ставим указатель по координатам плитки.
+            point = stbtabs.grid_tile_center(stbtabs.last_tile()) or stbtabs.grid_tile_center()
+            if point:
+                xdo("mousemove", str(point[0]), str(point[1]))
+    except Exception as exc:  # noqa: BLE001
+        key_log("на сетку не переключилось (%r)" % (exc,))
 
 
 def key_back_double():
@@ -136,9 +167,13 @@ def key_back_double():
     title = window_title()
     if is_browser(title):
         key_log("back ×2 → на сетку")
-        return cmd_grid([])
+        to_grid()
+        return 0
     key_log("back ×2 → прячу приложение (%s)" % title[:30])
-    return cmd_hide([])
+    cmd_hide([])
+    # Прячем окно — и сразу на сетку: 1080p, полный экран, курсор на своей плитке.
+    to_grid()
+    return 0
 
 
 def key_home():
@@ -156,16 +191,11 @@ def key_home():
         finish_all()
     else:
         finish_app()
+        to_grid()          # после «закончил» показываем сетку и ставим курсор на плитку
 
     mode_set("nuc")
-    as_user("wmctrl", "-a", BROWSER_WINDOW)
-    time.sleep(0.2)
-    for _ in range(8):
-        if is_grid():
-            break
-        xdo("key", "--clearmodifiers", "ctrl+Page_Up")
-        time.sleep(0.35)
     key_log("home → на сетку")
+    to_grid()
     return 0
 
 
@@ -177,7 +207,8 @@ KEY_ACTIONS = {
     "power", "volup", "voldown", "mute", "back", "home", "menu", "tobox",
     "ok", "up", "down", "left", "right", "prev", "next",
     "play", "playkey", "pausekey", "chup", "chdown",
-    "red", "green", "yellow", "blue", "info", "guide", "cc", "exit",
+    "red", "green", "yellow", "blue", "info", "guide", "cc", "exit", "tab", "tabback",
+    "del", "erase",
 } | {str(d) for d in range(10)}
 
 
@@ -211,9 +242,12 @@ def cmd_key(argv):
     if act not in KEY_ACTIONS:
         print("неизвестное действие: %s" % act, file=sys.stderr)
         return 2
+    # Экран погашен: это нажатие только снимает заставку, в приложение не идёт.
+    if screensaver_on():
+        return close_splash_now()
 
     # Нажатие пульта означает, что человек у экрана: заставку снимаем.
-    if splash_windows():
+    if screensaver_on():
         subprocess.Popen([stbcommon.SELF, "screensaver", "close"],
                          stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
                          encoding="utf-8")
@@ -233,6 +267,33 @@ def cmd_key(argv):
     # Громкость всегда в телевизор: звук идёт через HDMI, дальше ARC.
     if act in TV_VOLUME:
         return tv_key_press(act, TV_VOLUME[act])
+
+    # В форме на телевизоре стрелки фокус не двигают, а без Tab из логина в
+    # пароль не перейти. Канал вверх/вниз в режиме приставки свободен — отдаём
+    # его под Tab и Shift+Tab.
+    if act in ("chup", "chdown") and not tv:
+        key_name = "Tab" if act == "chup" else "shift+Tab"
+        key_log("%s → %s" % (act, key_name))
+        xdo("key", "--clearmodifiers", key_name)
+        return 0
+    # Стирание в поле ввода. С клавиатуры телефона BackSpace уже приходит
+    # (ime/deleteCharacters), эти действия — для пульта: стереть символ и
+    # очистить поле целиком, чтобы не вычищать точками по одной.
+    if act == "del":
+        key_log("del → BackSpace")
+        xdo("key", "--clearmodifiers", "BackSpace")
+        return 0
+    if act == "erase":
+        key_log("erase → очистить поле")
+        xdo("key", "--clearmodifiers", "ctrl+a")
+        xdo("key", "--clearmodifiers", "BackSpace")
+        return 0
+
+    if act in ("tab", "tabback"):
+        key_name = "Tab" if act == "tab" else "shift+Tab"
+        key_log("%s → %s" % (act, key_name))
+        xdo("key", "--clearmodifiers", key_name)
+        return 0
 
     # Кнопки, которые существуют только на телевизоре.
     if act in TV_ONLY:
@@ -276,12 +337,17 @@ def cmd_key(argv):
     if act in ("playkey", "pausekey"):
         if tv:
             return tv_key_press(act, "PLAY" if act == "playkey" else "PAUSE")
-        # На сетке выбор двигают стрелки — жмём выбранную плитку. В приложении
-        # Enter нажимает прежний фокус, поэтому нужен клик под указателем.
-        if is_ours(window_title()):
+        # На сетке выбор двигают стрелки — жмём выбранную плитку.
+        if is_grid(window_title()):
             key_log("%s → запуск выбранной плитки" % act)
             xdo("key", "--clearmodifiers", "Return")
             return 0
+        # В чужой странице раскладка такая: PLAY — Tab (из логина в пароль и
+        # дальше по форме), PAUSE — клик под указателем. Раньше обе жали под
+        # указателем, и перейти в поле пароля было нечем.
+        # Плей/пауза на панели с трекпадом — это ввод: навели курсор и нажали.
+        # Так человек ставит курсор в поле и жмёт кнопки. Оба имени (PLAY и
+        # PAUSE) приходят от одной кнопки, значит оба и есть клик.
         key_log("%s → нажатие под указателем" % act)
         xdo("click", "1")
         return 0
@@ -289,8 +355,24 @@ def cmd_key(argv):
     if act in ("play", "ok"):
         if tv:
             return tv_key_press(act, "ENTER" if act == "ok" else "PLAY")
-        key_log("%s → выбор плитки" % act)
+        # На сетке Enter запускает выбранную плитку. В чужой странице Enter
+        # отправляет форму (так логин уходил с пустым паролем), поэтому там
+        # нажимаем под указателем — как трекпад мышью.
+        if is_grid(window_title()):
+            key_log("%s → выбор плитки" % act)
+            xdo("key", "--clearmodifiers", "Return")
+            return 0
+        # В чужой странице OK — Enter. Из поля пароля он отправляет форму, поэтому
+        # целиться в кнопку входа не нужно. Переход между полями — клик по полю
+        # (плей/пауза), он же ставит курсор куда надо.
+        key_log("%s → Enter" % act)
         xdo("key", "--clearmodifiers", "Return")
+        return 0
+
+    if act == "blue" and not tv:
+        # Синяя кнопка в режиме приставки: включить или выключить 4K-режим.
+        value = stb4k.toggle()
+        key_log("blue → JMP_VIDEO_4K = %s" % value)
         return 0
 
     if act in COLOURS:

@@ -34,10 +34,15 @@ OLD = 10_000   # секунд — сведения устарели
     ("Suspend", False, True, True, 0, True),
     ("Active", False, True, False, 0, False),
     ("", None, True, True, 0, True),
-    # 3. телевизор ушёл из сети: первый промах — ждём, второй — выключен
+    # 3. телевизор ушёл из сети: это ещё не выключение (LG гасит Wi-Fi в своём
+    # сне), экран не трогаем, пока молчание не станет долгим
     ("", None, False, True, 1, True),
-    ("", None, False, True, 2, False),
-    ("Suspend", False, False, True, 2, False),
+    ("", None, False, True, 2, True),
+    ("", None, False, True, 74, True),
+    ("Suspend", False, False, True, 2, True),
+    # а вот долгое молчание — уже выключен
+    ("", None, False, True, 75, False),
+    ("Suspend", False, False, True, 100, False),
     # 4. ничего не знаем и никогда не знали — экран не трогаем
     ("", None, True, None, 0, False),
 ])
@@ -51,8 +56,9 @@ def test_cycle_off_then_on(watch):
     # включён
     assert watch.decide("Active", FRESH, True, None, 0) is True
     # выключили: SSAP пропал, телевизор ушёл из сети
-    assert watch.decide("", None, False, True, 1) is True     # первый промах — ждём
-    assert watch.decide("", None, False, True, 2) is False    # подтвердили: выключен
+    assert watch.decide("", None, False, True, 1) is True     # пропал из сети — ждём
+    assert watch.decide("", None, False, True, 20) is True    # всё ещё ждём: сон, не выключение
+    assert watch.decide("", None, False, True, 80) is False   # молчит давно — выключен
     # включили снова и он ответил
     assert watch.decide("Active", FRESH, True, False, 0) is True
 

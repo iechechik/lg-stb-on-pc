@@ -22,11 +22,14 @@ import asyncio
 import glob
 import json
 import os
+import ssl
 import sys
 import time
+import urllib.request
 
 sys.path.insert(0, "/opt/stb/lib")
 import stbconf  # noqa: E402
+import stbdiff  # noqa: E402
 
 STB_HOME = stbconf.get("STB_HOME", "/home/stbuser")
 for _p in glob.glob(os.path.join(STB_HOME, "tvctl", "lib", "python3*", "site-packages")):
@@ -231,6 +234,18 @@ def as_bool(raw, default=False):
     return str(raw).strip().lower() in ("on", "true", "1", "yes", "mute")
 
 
+FRAME = {"sig": None}      # прошлый кадр: живёт в памяти демона
+
+
+def fetch_image(uri):
+    """Скачать кадр с телевизора: сертификат у него свой, самоподписанный."""
+    ctx = ssl.create_default_context()
+    ctx.check_hostname = False
+    ctx.verify_mode = ssl.CERT_NONE
+    with urllib.request.urlopen(uri, context=ctx, timeout=10) as answer:
+        return answer.read()
+
+
 async def dispatch(client, cmd, req):
     """Одна команда. Контракт описан в docs/SYSTEM.md, раздел «Протокол stb-tv-link»."""
     if cmd == "state":
@@ -290,6 +305,39 @@ async def dispatch(client, cmd, req):
         return {"ok": True}
     if cmd == "scroll":
         await client.scroll(0, int(req.get("dy", 0)))
+        return {"ok": True}
+    if cmd == "shot":
+        started = time.time()
+        answer = await asyncio.wait_for(client.take_screenshot(), timeout=15)
+        uri = (answer or {}).get("imageUri")
+        if not uri:
+            return {"ok": False, "msg": "телевизор не отдал кадр"}
+        loop = asyncio.get_running_loop()
+        data = await loop.run_in_executor(None, fetch_image, uri)
+        try:
+            sig, black = await loop.run_in_executor(None, stbdiff.signature, data)
+        except Exception as exc:  # noqa: BLE001
+            return {"ok": False, "msg": "кадр не разобрался: %s" % str(exc)[:60]}
+        diff = None if FRAME["sig"] is None else stbdiff.diff_percent(FRAME["sig"], sig)
+        FRAME["sig"] = sig
+        app = STATE.get("app") or await client.get_current_app()
+        STATE["app"] = app
+        return {"ok": True, "app": app, "black": round(black, 1),
+                "diff": None if diff is None else round(diff, 2),
+                "ms": int((time.time() - started) * 1000)}
+    if cmd == "screen":
+        if as_bool(req.get("on", True)):
+            await client.turn_screen_on()
+            touch()
+            return {"ok": True}
+        # turnOffScreen этой прошивкой не поддержан (404): панель гасим штатной
+        # заставкой телевизора — она чёрная, телевизор остаётся включённым.
+        try:
+            await client.turn_screen_off()
+        except Exception as exc:  # noqa: BLE001
+            log("turnOffScreen не поддержан (%s) — гашу заставкой" % str(exc)[:40])
+            await client.show_screen_saver()
+        touch()
         return {"ok": True}
     if cmd == "apps":
         return {"ok": True, "apps": await client.get_apps_all()}

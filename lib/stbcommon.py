@@ -176,14 +176,16 @@ def mode_get():
 
 
 def mode_set(new):
-    """Переключить режим пульта: в режиме приставки работает заставка."""
+    """Переключить режим пульта: «nuc» — управляем приставкой, «tv» — телевизором.
+
+    Заставку режим не трогает. Раньше переключение на телевизор гасило сторожа:
+    остаток схемы, где заставка была чёрной страницей на приставке. Теперь
+    сторож смотрит картинку самого телевизора и нужен в обоих режимах — иначе
+    ни салюта, ни стендбая в приложениях телевизора не будет. Ручной выключатель
+    один: `stb screen off`.
+    """
     os.makedirs(os.path.dirname(MODE_FILE), exist_ok=True)
     mark_set(MODE_FILE, new + "\n")
-    try:
-        with open(SCREEN_FLAG, "w", encoding="utf-8") as f:
-            f.write("on\n" if new != "tv" else "off\n")
-    except OSError:
-        pass
     return new
 
 
@@ -228,10 +230,14 @@ def idle_log(msg):
     log_to("idle", msg)
 
 
-def splash_windows():
-    """Окна с чёрной заставкой (это вкладка в окне Firefox, не отдельное окно)."""
-    out = as_user("xdotool", "search", "--name", "Заставка").stdout.split()
-    return [w for w in out if w.isdigit()]
+def screensaver_on():
+    """Погашен ли экран по нашей воле.
+
+    Отметку ставит сторож тишины, а рисует чёрное уже сама сетка — без вкладки
+    и без перехода в браузер.
+    """
+    runtime = os.environ.get("XDG_RUNTIME_DIR", "/run/user/1000")
+    return os.path.exists(os.path.join(runtime, "stb-screenblank"))
 
 
 def key_log(msg):

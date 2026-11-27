@@ -68,7 +68,7 @@
     "icon": "🎞",
     "img": "icons/prowlarr.png",
     "type": "url",
-    "target": "http://misc.chech:9094"
+    "target": "http://misc.chech:9093"
   },
   {
     "id": "browser",
@@ -116,24 +116,6 @@
     "target": "/opt/stb/bin/stb poweroff --now"
   },
   {
-    "id": "lang",
-    "label": "Раскладка РУС/ENG",
-    "sub": "переключить",
-    "icon": "RU",
-    "img": "icons/keyboard.png",
-    "type": "command",
-    "target": "/opt/stb/bin/stb lang toggle"
-  },
-  {
-    "id": "buttons",
-    "label": "Кнопки",
-    "sub": "что нажимать",
-    "icon": "⌨",
-    "img": "icons/keyboard.png",
-    "type": "url",
-    "target": "http://127.0.0.1:8090/buttons"
-  },
-  {
     "id": "ui-restart",
     "label": "Перезапуск интерфейса",
     "sub": "браузер заново, чистая сетка",
@@ -142,5 +124,14 @@
     "type": "command",
     "target": "/opt/stb/bin/stb ui restart",
     "confirm": true
+  },
+  {
+    "id": "buttons",
+    "label": "Описание клавиатуры пульта",
+    "sub": "что нажимать",
+    "icon": "⌨",
+    "img": "icons/keyboard.png",
+    "type": "url",
+    "target": "http://127.0.0.1:8090/buttons"
   }
 ]

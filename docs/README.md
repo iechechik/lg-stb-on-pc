@@ -118,7 +118,6 @@ stb sound on | off       звук приставки (на сетке глуши
 stb ui restart           перезапуск интерфейса: браузер и сетка заново
 stb poweroff [--keep-tv|--dry-run|--now]   выключить телевизор, потом приставку
 
-stb lang [ru|en|toggle|status]   раскладка клавиатуры
 stb ctl [status|restart|stop|start]   службы
 ```
 

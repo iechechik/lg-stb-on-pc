@@ -1,0 +1,8 @@
+# Образец: рядом должен лежать config/logins.conf с настоящими данными.
+# Формат: <id плитки> = <логин> : <пароль>
+# Вход выполняет Marionette: поля находит сама страница, Tab'ами не угадываем.
+sonarr = admin : пароль
+radarr = admin : пароль
+prowlarr = admin : пароль
+filebrowser = admin : пароль
+seerr = admin : пароль

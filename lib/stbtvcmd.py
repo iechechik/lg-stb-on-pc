@@ -30,9 +30,6 @@ TV_INPUT = stbconf.get("TV_INPUT_ID", "")
 TV_APP = stbconf.get("TV_APP_ID", "")
 
 
-TV_LIVE = stbconf.get("TV_LIVE_APP", "com.webos.app.livetv")
-
-
 TV_SPEAKER = stbconf.get("TV_SPEAKER", "")
 
 
@@ -448,6 +445,19 @@ def cmd_tv_setting(argv):
     return subprocess.run([PY, "/opt/stb/lib/tv_setting.py"] + list(argv)).returncode
 
 
+POWER_ON_STATES = ("Active", "Screen Saver")
+
+
+def power_on(power):
+    """Включён ли телевизор. Салют — тоже включён.
+
+    Прошивка LG на своей заставке отвечает power="Screen Saver". Если считать
+    это выключением, сторож не гасит телевизор после салюта: он лишь ставит
+    отметку «уже погашен» и оставляет панель светиться до утра.
+    """
+    return (power or "").strip() in POWER_ON_STATES
+
+
 def tv_state(timeout=3):
     """Быстрая проба состояния телевизора. Пустой словарь — не ответил.
 
@@ -463,34 +473,13 @@ def tv_state(timeout=3):
         return {}
 
 
-def tv_shows_own_app():
-    """Телевизор показывает своё приложение, а не вход приставки.
-
-    Тогда заставка и гашение по простою запрещены: человек смотрит телевизор,
-    просто нажатий в нашу коробку не приходит. Именно из-за этого телевизор
-    однажды выключился посреди фильма.
-    """
-    if not TV_INPUT:
-        return False
-    ours = "com.webos.app." + TV_INPUT.lower().replace("_", "")
-    try:
-        app = tv_state(2).get("app") or ""
-    except Exception:  # noqa: BLE001
-        app = ""
-    if not app:
-        # None — «неизвестно», а не «телевизор показывает своё»: со значением
-        # True потеря связи с демоном сбрасывала отсчёт простоя.
-        return None
-    return app.lower() != ours
-
-
-SLEEP_STATES = ("Standby", "Screen Off", "Power Off", "Suspend", "Active Standby")
-
-
 def tv_power_state():
     """Состояние телевизора строкой; пусто, если он не отвечает."""
     out = as_user("tv", "powerstate").stdout.strip()
     return out
+
+
+SLEEP_STATES = ("Standby", "Screen Off", "Power Off", "Suspend", "Active Standby")
 
 
 def power_off_tv(timeout=20.0):

@@ -11,20 +11,23 @@ import sys
 import time
 
 import stbtvlast
+import stbtabs
+import stbmarionette
 import stbconf
 from stbcommon import (GRID_TITLE,STB_HOME,as_user,is_browser,is_grid,is_ours,key_log,
                        log_to,mark_clear,mark_read,mark_set,mode_get,say,sink_mute,
-                       sink_muted,splash_windows,tv_alive,user_env,user_uid,window_title,
+                       sink_muted,screensaver_on,tv_alive,user_env,user_uid,window_title,
                        xdo)
 from stbcommon import SCREEN_FLAG  # noqa: E402
 from stbtvcmd import cmd_tv  # noqa: E402
+from stbtvcmd import power_on  # noqa: E402
 from stbtvcmd import tv_state  # noqa: E402
 from stbcommon import idle_log  # noqa: E402
-from stbtvcmd import tv_shows_own_app  # noqa: E402
 from stbtvcmd import TV_APP  # noqa: E402
 from stbtvcmd import TV_INPUT  # noqa: E402
 from stbcommon import mode_set  # noqa: E402
 from stbtvcmd import wake_tv  # noqa: E402
+import stb4k  # noqa: E402
 
 
 def mark_age(path):
@@ -73,9 +76,25 @@ def cmd_hide(argv):
     except OSError:
         pass
     sink_mute(True)
-    minutes = int(stbconf.get("APP_HIDE_MINUTES", "10") or 0)
-    key_log("окно скрыто (%s) — вернусь или закрою через %d мин" % (name[:40], minutes))
+    minutes = hide_minutes()
+    key_log("окно скрыто (%s) — вернусь или закрою через %d мин" % (name[:40], minutes)
+            if minutes else "окно скрыто (%s) — закрою при выключении телевизора" % name[:40])
     return 0
+
+
+def hide_minutes():
+    """Сколько минут живёт брошенное приложение; 0 — не закрывать вовсе.
+
+    Не меньше порога заставки плюс минута. Иначе получается так: экран гаснет,
+    а через ту же минуту плеер закрывается — и вернуться в него человек уже не
+    может, плитка запускает холодный, двадцать секунд. Значение из конфига
+    меньше порога просто поднимаем.
+    """
+    minutes = int(stbconf.get("APP_HIDE_MINUTES", "0") or 0)
+    if minutes <= 0:
+        return 0
+    screen = int(stbconf.get("SCREENSAVER_MINUTES", "10") or 10)
+    return max(minutes, screen + 1)
 
 
 def hidden_check():
@@ -85,7 +104,7 @@ def hidden_check():
         age = time.time() - os.path.getmtime(mark)
     except OSError:
         return 0
-    minutes = int(stbconf.get("APP_HIDE_MINUTES", "10") or 0)
+    minutes = hide_minutes()
     if minutes <= 0 or age < minutes * 60:
         return 0
     title = ""
@@ -142,7 +161,9 @@ def hidden_check():
 def cmd_browser(argv):
     """Запустить Firefox окном на весь экран (служба stb-browser)."""
     env = user_env()
-    proc = subprocess.Popen(["/usr/bin/firefox-esr", "--no-remote",
+    # --marionette: встроенный канал управления. Профильная настройка
+    # marionette.enabled сама слушателя не поднимает — нужен этот флаг.
+    proc = subprocess.Popen(["/usr/bin/firefox-esr", "--marionette", "--remote-allow-system-access", "--no-remote",
                              "--profile", os.path.join(STB_HOME, ".mozilla/stb"),
                              "http://127.0.0.1:%s/" % stbconf.get("STB_WEB_PORT", "8090")],
                             env=env, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
@@ -152,7 +173,8 @@ def cmd_browser(argv):
         for line in listing.splitlines():
             if is_browser(line):
                 wid = line.split()[0]
-                subprocess.run(["wmctrl", "-i", "-r", wid, "-b", "add,maximized_vert,maximized_horz"],
+                # Стартуем сразу во весь экран: сетка не должна показывать полосы.
+                subprocess.run(["wmctrl", "-i", "-r", wid, "-b", "add,fullscreen"],
                                env=env, capture_output=True)
                 subprocess.run(["wmctrl", "-i", "-a", wid], env=env, capture_output=True)
                 return proc.wait()
@@ -359,6 +381,7 @@ def cmd_idle(argv):
         say_idle("ТВ включён → поднимаю интерфейс")
         governor("schedutil")
         cmd_screen(["on"])
+        screen_dim(False)      # выход мог остаться погашенным от «ТВ выключен»
         # Отметка подъёма: xprintidle считает простой и при погашенном экране,
         # поэтому без неё заставка срабатывает сразу после включения.
         try:
@@ -383,6 +406,11 @@ def cmd_idle(argv):
         cmd_screen(["off"])
         for unit in ("wireplumber", "pipewire-pulse.socket", "pipewire.socket"):
             as_user("systemctl", "--user", "stop", unit)
+        # Лишнее закрываем сразу, а не ждём включения: телевизор выключен — это
+        # powersave и тишина, держать в памяти зависший плеер незачем. Браузер с
+        # сеткой не трогаем (is_ours), поэтому включение показывает сетку сразу.
+        # Точка просмотра не теряется: её помнит сам Jellyfin.
+        finish_all()
 
         # Браузер не перезапускаем: холодный старт — до 20 с чёрного экрана.
         # Закрываем только окно плеера, оно держит экран и звук.
@@ -418,6 +446,10 @@ def cmd_screen(argv):
                 f.write("off\n")
         except OSError:
             pass
+        # Сначала вернуть яркость, потом стирать отметку: иначе отметка
+        # исчезает, а выход остаётся погашенным — и включать его уже некому
+        # (именно так телевизор показывал чёрный экран).
+        screen_dim(False)
         for marker in ("/run/stb/screenblank",
                        os.path.join(user_env()["XDG_RUNTIME_DIR"], "stb-screenblank")):
             mark_clear(marker)
@@ -429,11 +461,11 @@ def cmd_screen(argv):
         except OSError:
             state = "off"
         idle = as_user("xprintidle").stdout.strip() or "?"
-        blank = as_user("xdotool", "search", "--name", "Заставка").returncode == 0
+        blank = screensaver_on()
         print("состояние: %s" % state)
         print("порог: %s мин" % minutes)
         print("простой: %s мс" % idle)
-        print("чёрная вкладка: %s" % ("открыта" if blank else "нет"))
+        print("экран погашен: %s" % ("да" if blank else "нет"))
         return 0
     print("usage: stb screen on|off|status", file=sys.stderr)
     return 2
@@ -454,26 +486,20 @@ def current_layout():
 
 
 def type_url(url):
-    """Набрать адрес так, чтобы раскладка не превратила его в мусор.
+    """Набрать адрес в адресной строке.
 
-    В русской раскладке xdotool type выдаёт «h1t27p.0:/,/)1.217…», Firefox
-    отправляет это в поиск, и на экране появляется страница с подсказками
-    вместо сетки. Поэтому на время набора включаем us.
+    Раскладка приставки — us, поэтому латиница набирается как есть. Страховка на
+    случай сменённой раскладки: в ru из адреса получается мусор.
     """
-    was = current_layout()
-    if was and was != "us":
+    if current_layout() != "us":
         as_user("setxkbmap", "us")
         time.sleep(0.2)
-    try:
-        as_user("xdotool", "key", "--clearmodifiers", "ctrl+l")
-        time.sleep(0.2)
-        as_user("xdotool", "type", "--delay", "25", url)
-        time.sleep(0.3)
-        as_user("xdotool", "key", "--clearmodifiers", "Return")
-        time.sleep(1.0)
-    finally:
-        if was and was != "us":
-            as_user("setxkbmap", was)
+    as_user("xdotool", "key", "--clearmodifiers", "ctrl+l")
+    time.sleep(0.2)
+    as_user("xdotool", "type", "--delay", "25", url)
+    time.sleep(0.3)
+    as_user("xdotool", "key", "--clearmodifiers", "Return")
+    time.sleep(1.0)
 
 
 def firefox_windows(env):
@@ -484,9 +510,106 @@ def firefox_windows(env):
     real = []
     for wid in wins:
         title = as_user("xdotool", "getwindowname", wid).stdout
-        if is_ours(title) or "Заставка" in title:
+        if is_ours(title):
             real.append(wid)
     return real or wins
+
+
+def login_auto():
+    """Страница входа службы — заполнить её данными из logins.conf.
+
+    Поля ищет сам браузер (Marionette), поэтому логин и пароль больше не
+    попадают в чужие поля, как было при угадывании Tab'ами. Повтор не чаще
+    раза в минуту на адрес: если пароль неверный, форму не молотим.
+    """
+    if str(stbconf.get("LOGIN_AUTO", "1")).strip().lower() in ("0", "off", "no", "false"):
+        return 0
+    port = int(stbconf.get("MARIONETTE_PORT", "2828"))
+    if not stbmarionette.available(port=port, timeout=2):
+        return 0
+    marker = os.path.join(user_env()["XDG_RUNTIME_DIR"], "stb-login-auto")
+    try:
+        with stbtabs.connect() as conn:
+            tabs = conn.tabs()
+            chosen = [t for t in tabs if t.get("selected")]
+            url = (chosen[0].get("url") if chosen else "") or ""
+            tile_id = stbtabs.tile_for_url(url)
+            entry = login_entry(tile_id) if tile_id else None
+            if entry is None:
+                return 0
+            conn.content()
+            if not conn.js("!!document.querySelector('input[type=password]')"):
+                if os.path.exists(marker):
+                    mark_clear(marker)      # не страница входа — забыть отметку
+                return 0
+            user, password = entry
+            done = mark_read(marker, "")
+            if done.startswith(url + " "):
+                try:
+                    if time.time() - float(done.split(" ", 1)[1]) < 60:
+                        return 0
+                except (IndexError, ValueError):
+                    pass
+            mark_set(marker, "%s %s\n" % (url, time.time()))
+            key_log("страница входа %s — заполняю из logins.conf" % tile_id)
+            key_log("вход в %s: %s" % (tile_id, conn.fill_login(user, password)))
+            return 1
+    except (OSError, stbmarionette.MarionetteError) as err:
+        key_log("автовход не сработал: %s" % err)
+        return 0
+
+
+def login_entry(tile_id):
+    """Логин и пароль службы из config/logins.conf: (логин, пароль) или None."""
+    path = os.path.join(stbconf.get("STB_CONFIG_DIR", "/opt/stb/config"), "logins.conf")
+    try:
+        with open(path, encoding="utf-8") as f:
+            for raw in f:
+                line = raw.split("#", 1)[0].strip()
+                if "=" not in line:
+                    continue
+                key, value = line.split("=", 1)
+                if key.strip().lower() != (tile_id or "").strip().lower():
+                    continue
+                parts = [p.strip() for p in value.split(":")]
+                if len(parts) < 2:
+                    return None
+                return parts[0], parts[1]
+    except OSError:
+        return None
+    return None
+
+
+def cmd_login(argv):
+    """Войти в службу по данным из конфига: stb login sonarr.
+
+    Поля ищет сам браузер (Marionette): у страницы спрашивается поле пароля и
+    поле логина перед ним. Курсором и Tab'ами ничего не угадываем — именно из-за
+    угадывания логин с паролем попадали в чужие поля.
+    """
+    tile = (argv[0] if argv else "").strip()
+    if not tile:
+        print("usage: stb login <id плитки>  (данные — в config/logins.conf)",
+              file=sys.stderr)
+        return 2
+    entry = login_entry(tile)
+    if entry is None:
+        print("нет записи «%s» в config/logins.conf" % tile, file=sys.stderr)
+        return 1
+    user, password = entry
+    if not user or not password:
+        print("в записи «%s» пустой логин или пароль" % tile, file=sys.stderr)
+        return 1
+
+    as_user("wmctrl", "-a", BROWSER_WINDOW)
+    time.sleep(0.3)
+    try:
+        result = stbtabs.fill_login(user, password)
+    except (OSError, stbmarionette.MarionetteError) as err:
+        print("браузер не ответил: %s" % err, file=sys.stderr)
+        return 1
+    print("%s: %s" % (tile, result or "форма отправлена"))
+    return 0
 
 
 def cmd_grid(argv):
@@ -497,6 +620,10 @@ def cmd_grid(argv):
     через ctrl+w опасно — можно закрыть саму сетку и получить моргание.
     Поэтому просто переводим активную вкладку на адрес сетки.
     """
+    # Яркость возвращаем всегда: выход мог остаться погашенным заставкой или
+    # «ТВ выключен» (оба гасят именно яркость), а сетка — это первый экран,
+    # который человек должен увидеть сразу после включения телевизора.
+    screen_dim(False)
     env = user_env()
     wins = firefox_windows(env)
     if not wins:
@@ -519,55 +646,28 @@ def cmd_grid(argv):
 
 
 def close_splash_now():
-    """Закрыть заставку, не убивая окно сетки: гасим вкладку, а не окно."""
+    """Снять заставку: вернуть яркость, панель телевизора, убрать отметки."""
     runtime = user_env()["XDG_RUNTIME_DIR"]
-    for name in ("stb-screenblank", "stb-tv-slept"):
+    if os.path.exists(os.path.join(runtime, "stb-tv-blanked")):
+        # Панель гасили мы сами — её и возвращаем.
+        tv_screen(True)
+        log_to("system", "возвращаю панель телевизора", echo=True)
+    if os.path.exists(os.path.join(runtime, "stb-screenblank")):
+        screen_dim(False)
+    for name in ("stb-screenblank", "stb-tv-slept", "stb-tv-blanked"):
         mark_clear(os.path.join(runtime, name))
-    try:
-        screen_on = open(SCREEN_FLAG, encoding="utf-8").read().strip() == "on"
-    except OSError:
-        screen_on = True
-    # Возврат к экрану: показываем сетку в любом случае — она могла быть
-    # перекрыта чёрной вкладкой или страницей подсказок.
-    if screen_on and mode_get() == "nuc":
-        cmd_grid([])
     return 0
 
 
 def splash_present():
-    """Открыта ли заставка (чёрная вкладка)."""
-    return bool(splash_windows())
-
-
-def splash_fullscreen():
-    """Занимает ли заставка весь экран."""
-    geo = as_user("xdotool", "getactivewindow", "getwindowgeometry", "--shell").stdout
-    width = ""
-    for line in geo.splitlines():
-        if line.startswith("WIDTH="):
-            width = line.split("=", 1)[1]
-    display = as_user("xdotool", "getdisplaygeometry").stdout.split()
-    return bool(width) and bool(display) and width == display[0]
+    """Погашен ли экран по нашей воле (гашением выхода или панели)."""
+    return screensaver_on()
 
 
 def splash_open(port, opened_at):
-    """Перевести текущую вкладку на чёрную страницу во весь экран.
-
-    Новая вкладка не создаётся: она копила бы «Приставку» и включала верхние
-    строки Firefox, которые прячутся только при одной вкладке.
-    """
-    url = "http://127.0.0.1:%s/black" % port
-    as_user("xdotool", "key", "--clearmodifiers", "F11")
-    time.sleep(0.6)
-    type_url(url)
-    if not splash_fullscreen():
-        as_user("xdotool", "key", "--clearmodifiers", "F11")
-        time.sleep(0.4)
-    if not splash_present():
-        type_url(url)
-        as_user("xdotool", "key", "--clearmodifiers", "F11")
-        time.sleep(0.4)
+    """Погасить экран: гасим сам выход, окна остаются на месте."""
     mark_set(opened_at)
+    screen_dim(True)
 
 
 def idle_ms_capped(runtime):
@@ -589,13 +689,11 @@ def idle_ms_capped(runtime):
 
 def tv_sleep_if_idle(age, sleep_after, slept_marker, log):
     """Тишина дольше порога: гасим телевизор либо отмечаем, что гасить нечего."""
-    if mode_get() != "nuc" or tv_shows_own_app() is not False:
-        return
     power = tv_state().get("power") or ""
     if not power:
         log("тишина %d с — состояние телевизора неизвестно, не гашу" % age)
         return
-    if power == "Active":
+    if power_on(power):
         if cmd_tv(["off"]) == 0:
             mark_set(slept_marker)
             log("тишина %d с — гашу телевизор (порог %d мин)" % (age, sleep_after // 60))
@@ -611,40 +709,78 @@ def keep_display_awake():
     as_user("xset", "s", "off")
 
 
-def watching():
-    """Человек смотрит, а не простаивает: виден плеер или открыт сайт.
+def screen_output():
+    """Имя подключённого выхода X (HDMI-1 и подобное) — на нём и гасим."""
+    for line in as_user("xrandr", "--current").stdout.splitlines():
+        if " connected" in line:
+            return line.split()[0]
+    return ""
 
-    Простой считается только на сетке и в пустом браузере. Иначе поверх фильма
-    открывалась чёрная вкладка (порог 5 минут), а через 10 минут гас телевизор:
-    смотреть кино было невозможно.
+
+def screen_dim(on):
+    """Погасить или вернуть экран на уровне видеовыхода.
+
+    Окна не трогаются: ничего не сворачиваем и не перекрываем — поэтому после
+    возврата на экране ровно тот же кадр, включая паузу в фильме. Телевизор
+    продолжает получать сигнал, «нет сигнала» не появляется, возврат мгновенный.
     """
-    env = user_env()
+    output = screen_output()
+    if not output:
+        log_to("system", "не нашёл выход X — погасить экран нечем", echo=True)
+        return False
+    as_user("xrandr", "--output", output, "--brightness", "0" if on else "1")
+    return True
+
+
+def tv_frame():
+    """Кадр телевизора через демон: сколько изменилось и что за приложение.
+
+    Спрашиваем сам телевизор — он отдаёт кадр своего экрана. Поэтому правило
+    одно и для нашей приставки, и для его собственных приложений: идёт кино или
+    эфир — картинка меняется; картинка встала — можно гасить.
+    """
     try:
-        if jelly_windows(env):
-            return True
+        import asyncio
+
+        from stbtv import TvDaemon
+
+        return asyncio.run(TvDaemon().shot())
     except Exception:  # noqa: BLE001
-        pass
+        return None
+
+
+def tv_screen(on):
+    """Погасить или включить панель телевизора, оставив его включённым."""
     try:
-        for wid in firefox_windows(env):
-            title = as_user("xdotool", "getwindowname", wid).stdout
-            if title and not is_grid(title) and "Заставка" not in title:
-                return True
+        import asyncio
+
+        from stbtv import TvDaemon
+
+        return asyncio.run(TvDaemon().screen(on))
     except Exception:  # noqa: BLE001
-        pass
-    return False
+        return None
 
 
 def cmd_screensaver(argv):
-    """Сторож простоя: чёрная вкладка, затем гашение телевизора."""
+    """Сторож тишины: чёрный экран, затем гашение телевизора.
+
+    Тишина — это «нет ввода и не меняется картинка». Картинку спрашиваем у
+    самого телевизора, поэтому одно правило работает и на приставке, и в его
+    приложениях: играет кино или эфир — картинка живая, гасить нечего.
+    """
     if argv and argv[0] == "close":
         return close_splash_now()
     import fcntl
 
-    minutes = int(stbconf.get("SCREENSAVER_MINUTES", "5") or 5)
+    minutes = int(stbconf.get("SCREENSAVER_MINUTES", "10") or 10)
     limit_ms = minutes * 60 * 1000
     if limit_ms <= 0:
         return 0
-    sleep_after = int(stbconf.get("STB_TV_SLEEP_AFTER", "10") or 0) * 60
+    sleep_after = int(stbconf.get("STB_TV_SLEEP_AFTER", "5") or 0) * 60
+    shot_every = max(5, int(stbconf.get("SHOT_EVERY", "60") or 60))
+    diff_limit = float(stbconf.get("SHOT_DIFF_PERCENT", "2") or 2)
+    no_blank = [x.strip() for x in (stbconf.get("TV_NO_BLANK", "") or "").split(",") if x.strip()]
+    our_input = stbconf.get("TV_INPUT", "com.webos.app.hdmi3")
     port = stbconf.get("STB_WEB_PORT", "8090")
     runtime = user_env()["XDG_RUNTIME_DIR"]
     opened_at = os.path.join(runtime, "stb-screenblank")
@@ -661,77 +797,137 @@ def cmd_screensaver(argv):
         log_to("system", msg, echo=True)
 
     mark_clear(slept_marker)
-    log("сторож заставки: порог %d мин" % minutes)
+    screen_dim(False)      # если прошлый раз экран остался погашенным
+    log("сторож тишины: %d мин без ввода и без движения картинки, кадр раз в %d с"
+        % (minutes, shot_every))
 
-    tick = 0
-    watching_until = 0.0
+    alive_at = time.monotonic()    # когда картинка последний раз менялась
+    blanked = None                 # "dim" — погашен выход, "screen" — панель
+    blanked_at = 0.0               # когда погасили: свои же xdotool-нажатия при
+                                   # открытии вкладки сбрасывают простой ввода
+    app = ""                       # что телевизор показывал в последний раз
+    next_shot = 0.0
+    awake_tick = 0
     while True:
-        screen = mark_read(SCREEN_FLAG, "on")
-        own = tv_shows_own_app()
-
-        # Телевизор наш или погашен: заставка не нужна.
-        if screen != "on" or mode_get() != "nuc" or own is True:
+        if mark_read(SCREEN_FLAG, "on") != "on":
             close_splash_now()
+            blanked = None
             time.sleep(5)
             continue
 
-        # Чужой экран: новую заставку не открываем, уже открытую не трогаем —
-        # короткий сбой связи не повод её закрывать.
-        if own is None and not os.path.exists(opened_at):
-            time.sleep(5)
+        # Телевизор уже погашен (стендбай, «экран выключен»). Гасить нечего, и
+        # чёрный слой держать нельзя: после включения человек видел бы чёрный
+        # экран, а таймер досчитывал бы минуту и гасил телевизор повторно.
+        power = (tv_state() or {}).get("power") or ""
+        # Спящий телевизор вообще не отвечает, и power приходит пустым: поэтому
+        # смотрим ещё и сеть — иначе чёрный слой оставался висеть.
+        if power != "Active" and not tv_alive():
+            if blanked is not None:
+                close_splash_now()
+                blanked = None
+                log("телевизор погашен — снимаю заставку")
+            alive_at = time.monotonic()
+            time.sleep(10)
             continue
 
-        # Сетка на экране — приставка заглушена. Правило безусловное: неважно,
-        # каким путём человек вернулся на сетку, звук не останется включённым.
+        # Салют уже на экране (остался с прошлого раза или телевизор включили в
+        # него): это наше гашение, а не живая картинка. Без этого кадры салюта
+        # выглядят как «смотрят» — фейерверк меняется каждую минуту — и сторож
+        # не гасит телевизор по таймауту никогда.
+        if blanked is None and power == "Screen Saver":
+            blanked = "screen"
+            blanked_at = time.monotonic()
+            tv_blanked_mark = os.path.join(runtime, "stb-tv-blanked")
+            if not os.path.exists(tv_blanked_mark):
+                mark_set(tv_blanked_mark)
+            log("салют уже на экране — считаю панель погашенной")
+
+        # Сетка на экране — приставка заглушена. Правило прежнее и безусловное.
         if mode_get() == "nuc" and not sink_muted() and is_grid(window_title()):
             sink_mute(True)
 
-        # Кино или открытый сайт — это не простой. Заставку, если она успела
-        # открыться, закрываем: фильм важнее.
-        if watching():
-            watching_until = time.monotonic()
-            if os.path.exists(opened_at):
-                close_splash_now()
-            time.sleep(5)
-            continue
+        now = time.monotonic()
+        if now >= next_shot:
+            next_shot = now + shot_every
+            answer = tv_frame()
+            if answer and answer.get("ok"):
+                app = str(answer.get("app") or "")
+                diff = answer.get("diff")
+                black = float(answer.get("black") or 0)
+                if blanked == "screen":
+                    # Панель погашена штатной заставкой телевизора: на чёрном там
+                    # салют, и покадровое сравнение считало бы его живой картинкой.
+                    # Признак возврата один: экран снова показывает не чёрное.
+                    if black < 85:
+                        blanked = None
+                        alive_at = time.monotonic()
+                        log("картинка вернулась — снимаю гашение")
+                elif blanked == "dim":
+                    # Экран погасили мы сами. Переход «картинка → чёрное» — это
+                    # наше же гашение, поэтому сравнивать кадры тут бессмысленно:
+                    # разница огромная, и сторож снимал гашение сразу после него.
+                    if not splash_present():
+                        blanked = None
+                        alive_at = time.monotonic()
+                        log("экран вернули мимо сторожа — снимаю отметку")
+                else:
+                    alive = False
+                    if app in no_blank:
+                        alive = True
+                    elif diff is not None and diff >= diff_limit:
+                        alive = True
+                    elif black >= 99 and app and app != our_input:
+                        # Так телевизор отдаёт защищённый контент: чёрный кадр при
+                        # живом фильме. Не гасим, иначе выключим посреди просмотра.
+                        alive = True
+                    if alive:
+                        alive_at = time.monotonic()
 
         idle = idle_ms_capped(runtime)
-        if watching_until:
-            # xprintidle помнит всё время фильма; отсчёт ведём от конца просмотра.
-            idle = min(idle, int((time.monotonic() - watching_until) * 1000))
+        quiet_ms = int((time.monotonic() - alive_at) * 1000)
 
-        if os.path.exists(opened_at):
-            age = mark_age(opened_at) or 0
-            if age >= 10 and idle < 3000:
-                close_splash_now()
-                time.sleep(2)
+        if blanked is None:
+            if idle >= limit_ms and quiet_ms >= limit_ms:
+                if app and app != our_input:
+                    tv_screen(False)
+                    mark_set(os.path.join(runtime, "stb-tv-blanked"))
+                    blanked = "screen"
+                    blanked_at = time.monotonic()
+                    log("тишина %d мин — гашу панель телевизора (%s)" % (minutes, app))
+                else:
+                    # Отметка ставится до гашения: если выход погасить не удалось,
+                    # отсчёт до стендбая всё равно уже идёт.
+                    splash_open(port, opened_at)
+                    blanked = "dim"
+                    blanked_at = time.monotonic()
+                    log("тишина %d мин — чёрный экран на приставке" % minutes)
                 continue
+        else:
+            if idle < 3000 and time.monotonic() - blanked_at > 5:
+                # Нажали наш пульт: экран возвращаем сразу, не дожидаясь кадра.
+                # Первая пара секунд не в счёт: F11 и адрес при открытии чёрной
+                # первые секунды не в счёт: наши же команды гашения сбрасывают
+                # простой ввода (xrandr и правка яркости — не ввод человека).
+                close_splash_now()
+                if blanked == "screen":
+                    tv_screen(True)
+                blanked = None
+                alive_at = time.monotonic()
+                log("кнопка — возвращаю экран")
+                continue
+            # Ветки ставят разные отметки: гашение выхода — stb-screenblank,
+            # салют — stb-tv-blanked. Раньше возраст всегда спрашивали у первой,
+            # и после салюта телевизор не уходил в стендбай никогда.
+            mark = opened_at if blanked == "dim" else os.path.join(runtime, "stb-tv-blanked")
+            age = mark_age(mark) or 0
             if sleep_after > 0 and age >= sleep_after and not os.path.exists(slept_marker):
                 tv_sleep_if_idle(age, sleep_after, slept_marker, log)
-            time.sleep(2)
-            continue
 
-        if idle >= limit_ms:
-            # Отметка ставится до попытки открыть вкладку: без браузера
-            # заставка не откроется, но отсчёт до гашения уже идёт.
-            mark_set(opened_at)
-            splash_open(port, opened_at)
-            time.sleep(2)
-            continue
-
-        if splash_present() or not grid_window():
-            cmd_grid([])
-            time.sleep(2)
-            continue
-
-        tick += 1
-        if tick >= 15:
-            tick = 0
+        awake_tick += 1
+        if awake_tick >= 30:
+            awake_tick = 0
             keep_display_awake()
-        time.sleep(10 if idle < limit_ms - 90000 else 2)
-
-
-XDISPLAY = {"DISPLAY": ":0"}
+        time.sleep(10 if blanked is None else 5)
 
 
 BROWSER_WINDOW = "Mozilla Firefox"    # имя окна для wmctrl -a
@@ -761,6 +957,10 @@ def finish_all():
 def finish_app():
     """Закрыть приложение насовсем: Home означает «закончил», а не «вернусь»."""
     sink_mute(True)           # после Home всегда сетка — звук приставки не нужен
+    try:
+        stb4k.to_hd()         # сервер ещё считает фильм играющим — возвращаем 1080p сами
+    except Exception:  # noqa: BLE001
+        pass
     mark = hidden_mark()
     hidden_title = ""
     try:
@@ -805,8 +1005,25 @@ def cmd_ui(argv):
         time.sleep(0.5)
         if grid_window():
             break
+    # После перезапуска окно поднимается обычным: возвращаем полноэкранный вид,
+    # иначе интерфейс выглядит сломанным.
+    try:
+        found = as_user("xdotool", "search", "--name", "Приставка").stdout.split()
+        if found:
+            as_user("wmctrl", "-i", "-r", found[-1], "-b", "add,fullscreen")
+            as_user("xdotool", "windowactivate", found[-1])
+    except Exception:  # noqa: BLE001
+        pass
     cmd_grid([])
+    try:
+        stbtabs.reset_cursor()
+    except Exception:  # noqa: BLE001
+        pass
     say("интерфейс перезапущен")
+    try:
+        as_user("notify-send", "-t", "4000", "Приставка", "Интерфейс перезапущен", timeout=10)
+    except Exception:  # noqa: BLE001
+        pass
     return 0
 
 
@@ -899,23 +1116,22 @@ def cmd_sound(argv):
     return 0
 
 
-def cmd_lang(argv):
-    """Раскладка клавиатуры: stb lang [ru|en|toggle|status]."""
-    what = argv[0] if argv else "status"
-    current = current_layout
-
-    if what == "status":
-        print(current())
-        return 0
-    if what == "toggle":
-        what = "us" if current() == "ru" else "ru"
-    elif what == "en":
-        what = "us"
-    elif what == "ru":
-        pass
-    else:
-        print("usage: stb lang [ru|en|toggle|status]", file=sys.stderr)
-        return 2
-    as_user("setxkbmap", what)
-    print(what)
-    return 0
+def window_mode(full=True):
+    """Полный экран или обычное окно для окна приставки."""
+    try:
+        found = as_user("xdotool", "search", "--name", "Приставка").stdout.split()
+    except Exception:  # noqa: BLE001
+        return False
+    if not found:
+        return False
+    wid = found[-1]
+    try:
+        as_user("wmctrl", "-i", "-r", wid, "-b",
+                "add,fullscreen" if full else "remove,fullscreen")
+        if full:
+            as_user("xdotool", "windowactivate", wid)
+        else:
+            as_user("wmctrl", "-i", "-r", wid, "-b", "add,maximized_vert,maximized_horz")
+    except Exception:  # noqa: BLE001
+        return False
+    return True

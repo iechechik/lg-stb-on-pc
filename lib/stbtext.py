@@ -6,7 +6,26 @@
 Отправка и режим передаются снаружи: run(cmd) и mode().
 """
 import asyncio
+import subprocess
 import time
+
+
+def _layout():
+    """Текущая раскладка X.
+
+    В русской раскладке xdotool type молча теряет заглавные латинские: «Mam13Tan»
+    печатается как «mam13Tan», и пароль не подходит. Поэтому перед набором
+    включаем us, после — возвращаем прежнюю.
+    """
+    try:
+        out = subprocess.run(["setxkbmap", "-query"], capture_output=True,
+                             text=True, timeout=5).stdout
+    except (OSError, subprocess.SubprocessError):
+        return ""
+    for line in out.splitlines():
+        if line.startswith("layout:"):
+            return line.split(":", 1)[1].strip()
+    return ""
 
 
 class TextBuffer:
@@ -82,6 +101,18 @@ class TextBuffer:
         limit = self.single_gap if len(text) == 1 else self.dup_gap
         return gap <= limit
 
+    async def _type(self, text):
+        """Напечатать текст. Раскладка приставки всегда us.
+
+        Переключений нет: us ставится один раз при старте. Здесь только страховка
+        — если раскладку всё же сменили, вернуть us: в ru xdotool теряет латинские
+        буквы (замерено: «Mam13Tan» → «13»), а кириллицу браузер принимает и в us.
+        """
+        if _layout().split(",")[0] != "us":
+            await self.run(["setxkbmap", "us"], timeout=5)
+        await self.run(["xdotool", "type", "--clearmodifiers", "--delay", "80", text],
+                       timeout=30)
+
     def reset(self):
         """Enter или удаление: дальше считаем с чистого листа.
 
@@ -123,7 +154,7 @@ class TextBuffer:
         if self.mode() == "tv":
             await self.run(["/opt/stb/bin/stb", "tv", "text", "--", chunk])
         else:
-            await self.run(["xdotool", "type", "--clearmodifiers", "--delay", "80", chunk], timeout=30)
+            await self._type(chunk)
         self.log(f"ТЕКСТ: допечатал {chunk!r}")
 
     def _backspace(self, count):
@@ -139,5 +170,5 @@ class TextBuffer:
             await self.run(["/opt/stb/bin/stb", "tv", "text", "--", text])
         else:
             await self.run(["xdotool", "key", "--clearmodifiers", "ctrl+a"], timeout=5)
-            await self.run(["xdotool", "type", "--clearmodifiers", "--delay", "80", text], timeout=30)
+            await self._type(text)
         self.log(f"ТЕКСТ: заменил всё на {text!r}")

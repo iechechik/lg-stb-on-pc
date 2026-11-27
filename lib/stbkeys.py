@@ -40,7 +40,7 @@ for _d in range(10):
     KEY_ACTIONS[str(_d)] = ("key", str(_d))
 
 # действия, которые остаются за диспетчером (нужна логика, а не одна кнопка)
-DISPATCHER_ONLY = {"power", "tobox"}
+DISPATCHER_ONLY = {"power", "tobox", "del", "erase", "tab", "tabback"}
 
 
 def request(action):

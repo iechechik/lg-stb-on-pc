@@ -44,7 +44,10 @@ def test_double_back_keeps_its_specifics():
     """Двойной Back: приставка в ТВ, сетка из браузера, спрятать приложение."""
     text = func("key_back_double")
     assert 'cmd_key(["tobox"])' in text
-    assert "cmd_grid" in text
+    # Из браузера уходим на сетку переключением её вкладки, а не загрузкой адреса:
+    # раньше cmd_grid переписывал адрес текущей вкладки и службы терялись.
+    assert "to_grid()" in text
+    assert "cmd_grid(" not in text
     assert "cmd_hide" in text
 
 

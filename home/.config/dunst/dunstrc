@@ -1,29 +1,41 @@
 [global]
     monitor = 0
     follow = none
-    width = 420
-    height = (0, 120)
+
+    # Приставка: сообщения короткие, но должны читаться с трёх метров и не рваться.
+    width = 900
+    height = (0, 200)
     origin = bottom-center
-    offset = (40, 70)
-    notification_limit = 3
-    font = DejaVu Sans 26
-    frame_width = 2
-    frame_color = "#4a6fa5"
+    offset = (0, 120)
+        padding = 18
+    horizontal_padding = 24
+    text_icon_padding = 12
+    frame_width = 3
+    frame_color = "#6aa9ff"
     separator_color = frame
-    corner_radius = 12
-    timeout = 3
+    corner_radius = 14
+    font = DejaVu Sans 24
+    alignment = left
+    format = "<b>%s</b>\n%b"
+    markup = full
+    word_wrap = yes
+    ignore_newline = no
+
+    # Новое сообщение заменяет старое: иначе они ложатся друг на друга.
+    stack = no
+    indicate_hidden = no
 
 [urgency_low]
-    background = "#11151c"
-    foreground = "#e6edf3"
-    timeout = 1.5
+    background = "#1e1e1e"
+    foreground = "#eeeeee"
+    timeout = 3
 
 [urgency_normal]
-    background = "#11151c"
+    background = "#1e1e1e"
     foreground = "#ffffff"
-    timeout = 3
+    timeout = 4
 
 [urgency_critical]
-    background = "#4a1111"
+    background = "#8b1a1a"
     foreground = "#ffffff"
-    timeout = 3
+    timeout = 6

@@ -166,3 +166,14 @@ def test_asyncio_imported_on_demand():
     top = [n.module for n in tree.body
            if isinstance(n, ast.ImportFrom) and n.module]
     assert "stbtv" not in top
+
+
+def test_first_press_after_blank_is_swallowed():
+    """Нажатие, снимающее заставку, не должно доходить до приложения."""
+    recv = src("bin/stb-wifi-remote")
+    before_pointer = recv.split('if text.startswith("type:move")')[0]
+    assert "screensaver_present()" in before_pointer
+    assert "close_screensaver()" in before_pointer
+    act = src("lib/stbactions.py")
+    body = act.split("def cmd_key(argv):")[1].split("\ndef ")[0]
+    assert "screensaver_on()" in body and "close_splash_now()" in body

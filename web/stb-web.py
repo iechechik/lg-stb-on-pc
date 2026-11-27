@@ -183,17 +183,10 @@ def load_buttons():
     return load_json_file(BUTTONS)
 
 
-BLACK_PAGE = (
-    "<!doctype html><html lang=ru><meta charset=utf-8><title>Заставка</title>"
-    "<style>html,body{margin:0;height:100vh;background:#000;overflow:hidden;"
-    "cursor:none}</style><body></body></html>"
-)
-
-
 class Handler(BaseHTTPRequestHandler):
     server_version = "stb-web/1.0"
 
-    def log_message(self, fmt, *args):  # pylint: disable=arguments-differ  # pylint: disable=arguments-differ
+    def log_message(self, fmt, *args):  # pylint: disable=arguments-differ
         sys.stdout.write("%s - %s\n" % (self.address_string(), fmt % args))
         sys.stdout.flush()
 
@@ -223,8 +216,6 @@ class Handler(BaseHTTPRequestHandler):
                     self._send(200, f.read(), "text/html; charset=utf-8")
             except OSError as e:
                 self._json(500, {"ok": False, "msg": str(e)})
-        elif path in ("/black", "/black.html"):
-            self._send(200, BLACK_PAGE, "text/html; charset=utf-8")
         elif path in ("/buttons", "/buttons.html"):
             self._send(200, render_buttons(), "text/html; charset=utf-8")
         elif path in ("/", "/index.html"):
@@ -318,6 +309,9 @@ class Handler(BaseHTTPRequestHandler):
             subprocess.run(["/opt/stb/bin/stb", "sound", "on"],
                            capture_output=True, timeout=10)
             self._json({"ok": True})
+        elif path in ("/window/fullscreen", "/window/windowed"):
+            self._window_mode(path.endswith("fullscreen"))
+
         elif path.startswith("/run/"):
             self._run(path[len("/run/"):].strip("/"))
         elif path.startswith("/icons/"):
@@ -343,6 +337,23 @@ class Handler(BaseHTTPRequestHandler):
                 self._send(200, f.read(), ctype)
         except (OSError, ValueError):
             self._json(404, {"ok": False, "msg": "нет файла " + rel})
+
+
+    def _window_mode(self, full):
+        """Полный экран или окно для окна приставки (плитка «Браузер» — окно)."""
+        env = dict(os.environ)
+        env.setdefault("DISPLAY", ":0")
+        found = subprocess.run(["xdotool", "search", "--name", "Приставка"],
+                               capture_output=True, text=True, env=env).stdout.split()
+        if not found:
+            return self._json(409, {"ok": False, "msg": "окно не найдено"})
+        wid = found[-1]
+        action = "add,fullscreen" if full else "remove,fullscreen"
+        subprocess.run(["wmctrl", "-i", "-r", wid, "-b", action], env=env, capture_output=True)
+        if not full:
+            subprocess.run(["wmctrl", "-i", "-r", wid, "-b", "add,maximized_vert,maximized_horz"],
+                           env=env, capture_output=True)
+        return self._json(200, {"ok": True, "msg": "полный экран" if full else "окно"})
 
     def _run(self, btn_id):
         try:
