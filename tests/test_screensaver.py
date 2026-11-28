@@ -68,9 +68,11 @@ def test_diff_handles_missing_frame():
 def test_old_grid_screensaver_is_gone():
     """Старый сторож «только на сетке» заменён одним правилом."""
     desk = src("lib/stbdesktop.py")
+    scr = src("lib/stbscreensaver.py")
     assert "def watching" not in desk
-    assert "def tv_frame" in desk
-    assert "tv_shows_own_app" not in desk.split("def cmd_screensaver")[1]
+    assert "def tv_frame" in scr          # сторож тишины живёт в своём модуле
+    assert "def cmd_screensaver" not in desk
+    assert "tv_shows_own_app" not in scr.split("def cmd_screensaver")[1]
 
 
 def conf_value(name):

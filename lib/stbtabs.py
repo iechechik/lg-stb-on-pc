@@ -124,6 +124,60 @@ def reset_cursor():
     return False
 
 
+def needs_refit(inner, screen):
+    """Страница считает себя выше экрана — окно надо перевести в fullscreen заново.
+
+    После смены разрешения (2160→1080) Firefox иногда сохраняет старую высоту
+    области просмотра: страница рисуется выше экрана, шапка сетки уезжает за
+    верхний край. Подталкивание размера окна не помогает, помогает только
+    снятие и повторная установка fullscreen.
+    """
+    try:
+        return int(inner) > int(screen) + 1
+    except (TypeError, ValueError):
+        return False
+
+
+def _screen_height():
+    """Высота экрана из xrandr (HDMI-1)."""
+    out = stbcommon.as_user("xrandr").stdout or ""
+    for line in out.splitlines():
+        if line.startswith("HDMI-1"):
+            for token in line.split():
+                if "x" in token and "+" in token:
+                    return int(token.split("+")[0].split("x")[1])
+    return 0
+
+
+def _grid_window():
+    found = stbcommon.as_user("xdotool", "search", "--name", stbcommon.GRID_TITLE).stdout or ""
+    ids = [w for w in found.split() if w.isdigit()]
+    return ids[0] if ids else ""
+
+
+def refit():
+    """Вернуть окну сетки правильный размер страницы. True — пришлось чинить."""
+    height = _screen_height()
+    if not height:
+        return False
+    try:
+        with connect() as conn:
+            conn.content()
+            inner = conn.js("window.innerHeight")
+    except (OSError, stbmarionette.MarionetteError):
+        return False
+    if not needs_refit(inner, height):
+        return False
+    wid = _grid_window()
+    if not wid:
+        return False
+    stbcommon.as_user("wmctrl", "-i", "-r", wid, "-b", "remove,fullscreen")
+    time.sleep(0.4)
+    stbcommon.as_user("wmctrl", "-i", "-r", wid, "-b", "add,fullscreen")
+    stbcommon.log_to("system", "окно сетки: переставил fullscreen (%s → %s)" % (inner, height))
+    return True
+
+
 def select_tile(tile_id=None):
     """Поставить подсветку на плитку, с которой человек ушёл.
 
@@ -171,44 +225,6 @@ def grid_tile_center(tile_id=None):
 
 
 _bars = {}
-
-
-def set_grid_bars(hide, conn=None):
-    """Спрятать или показать верхние строки браузера (адрес и вкладки).
-
-    Решает не CSS по числу вкладок (такой селектор не сработал), а отметка на
-    самом окне: на сетке ставим stb-grid, на страницах снимаем.
-    """
-    action = "r.setAttribute('stb-grid', '1')" if hide else "r.removeAttribute('stb-grid')"
-    script = "(() => {const r = document.documentElement; %s; return 1})()" % action
-    if conn is None:
-        with connect() as fresh:
-            fresh.chrome()
-            return fresh.js(script)
-    conn.chrome()
-    return conn.js(script)
-
-
-def follow_grid_bars():
-    """Держать полосы по тому, что на экране: сетка или страница."""
-    try:
-        with connect() as conn:
-            tabs = conn.tabs()
-            chosen = [tab for tab in tabs if tab.get("selected")]
-            url = (chosen[0].get("url") if chosen else "") or ""
-            # Скрываем только на сетке и на страницах наших служб; на
-            # обычных сайтах (поиск, YouTube) полосы нужны.
-            local = GRID in url or "misc.chech" in url or "misc.local" in url
-            hide = local
-            if _bars.get("hide") == hide:
-                return hide
-            set_grid_bars(hide, conn)
-            _bars["hide"] = hide
-            stbcommon.log_to("keys", "верхние строки: %s"
-                             % ("скрыты (сетка)" if hide else "показаны"))
-            return hide
-    except (OSError, stbmarionette.MarionetteError):
-        return None
 
 
 def note(tabs):

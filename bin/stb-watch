@@ -423,6 +423,8 @@ def set_interface(state):
 
 def watch_tv():
     log("tv", "старт: следим за телевизором")
+    next_4k = 0.0          # когда в следующий раз спрашивать Jellyfin про 4K
+    last_4k_err = 0.0      # чтобы ошибка не забивала журнал каждым проходом
     if POWEROFF_AFTER > 0:
         log("tv", "простой: приставка выключится после %d с без телевизора" % POWEROFF_AFTER)
 
@@ -441,15 +443,17 @@ def watch_tv():
         except Exception:  # noqa: BLE001
             pass
         # Режим выхода под содержимое: 4K-поток → 2160p, иначе 1080p.
-        try:
-            stb4k.check()
-        except Exception:  # noqa: BLE001
-            pass
-        # Верхние строки браузера: на сетке их нет, на страницах они есть.
-        try:
-            stbtabs.follow_grid_bars()
-        except Exception:  # noqa: BLE001
-            pass
+        # Проверяем не каждый проход: запрос к серверу синхронный, а цикл сторожа
+        # короткий — иначе опрос питания телевизора ждёт сеть. Смена режима всё
+        # равно не чаще одной в 5 секунд, так что 10 с хватает.
+        if time.monotonic() >= next_4k:
+            next_4k = time.monotonic() + 10
+            try:
+                stb4k.check()
+            except Exception as err:  # noqa: BLE001
+                if time.monotonic() - last_4k_err > 300:
+                    last_4k_err = time.monotonic()
+                    log("tv", "4K: проверка не удалась: %r" % (err,))
         # Брошенные вкладки: закрываем те, что не были активны дольше порога.
         try:
             # Вкладки живут по общему таймауту приложений: отдельного

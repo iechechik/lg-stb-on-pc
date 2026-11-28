@@ -24,7 +24,7 @@ import stbcommon
 import stbconf
 
 SERVER = str(stbconf.get("JELLYFIN_URL", "") or "").rstrip("/")
-DEVICE = "tv-box1"
+CLIENT = "jellyfin desktop"      # так плеер представляется серверу
 KEY_FILE = os.path.join(stbconf.get("STB_CONFIG_DIR", "/opt/stb/config"), "jellyfin.key")
 
 MODE_4K = "3840x2160"
@@ -43,17 +43,12 @@ def _key():
 
 
 def _conf(key, default=""):
-    """Значение из stb.conf как есть, без кэша: настройку меняют на ходу."""
+    """Значение из конфига: stbconf.load перечитывает файл, кэша нет."""
     path = os.path.join(stbconf.get("STB_CONFIG_DIR", "/opt/stb/config"), "stb.conf")
     try:
-        with open(path, encoding="utf-8") as f:
-            for line in f:
-                line = line.strip()
-                if line.startswith(key + "="):
-                    return line.split("=", 1)[1].split("#")[0].strip().strip('"').strip("'")
-    except OSError:
-        pass
-    return default
+        return stbconf.load(path).get(key, default)
+    except Exception:  # noqa: BLE001
+        return default
 
 
 def video_mode():
@@ -72,25 +67,61 @@ def sessions():
     req = urllib.request.Request(SERVER + "/Sessions",
                                  headers={"Authorization": 'MediaBrowser Token="%s"' % key})
     try:
-        with urllib.request.urlopen(req, timeout=5) as resp:
+        with urllib.request.urlopen(req, timeout=2) as resp:
             return json.loads(resp.read().decode("utf-8"))
     except (OSError, ValueError):
         return []
 
 
+def pick_session(items):
+    """Выбрать сессию нашего плеера из ответа /Sessions.
+
+    Опознаём по клиенту: имя устройства приходит от самого плеера и может
+    смениться (переименовали в Jellyfin, другой профиль). Если в конфиге задано
+    `JELLYFIN_DEVICE`, оно сужает выбор; если подходящей сессии нет — берём
+    единственную играющую.
+    """
+    playing_now = [s for s in items or [] if s.get("NowPlayingItem")]
+    ours = [s for s in playing_now if CLIENT in (s.get("Client") or "").lower()]
+    want = str(_conf("JELLYFIN_DEVICE", "") or "").strip()
+    if want:
+        exact = [s for s in ours if (s.get("DeviceName") or "") == want]
+        if exact:
+            ours = exact
+        else:
+            exact = [s for s in playing_now if (s.get("DeviceName") or "") == want]
+            ours = exact or ours
+    return (ours or playing_now or [None])[0]
+
+
+def session_info():
+    """Какая сессия опознана и как она играет — для `stb status`.
+
+    Пусто — ни одной подходящей сессии: значит и 4K решать не по чему.
+    """
+    sess = pick_session(sessions())
+    if not sess:
+        return {}
+    ti = sess.get("TranscodingInfo") or {}
+    return {"device": sess.get("DeviceName") or "",
+            "client": sess.get("Client") or "",
+            "method": (sess.get("PlayState") or {}).get("PlayMethod") or "",
+            "codec": (ti.get("VideoCodec") or "").upper()}
+
+
 def playing():
-    """(высота потока, пауза, частота кадров) для нашего плеера."""
-    for sess in sessions():
-        if sess.get("DeviceName") != DEVICE or not sess.get("NowPlayingItem"):
-            continue
-        height, fps = 0, None
+    """(высота, пауза, частота кадров, ширина) для нашего плеера."""
+    sess = pick_session(sessions())
+    if sess:
+        height, width, fps = 0, 0, None
         for stream in sess["NowPlayingItem"].get("MediaStreams") or []:
             if stream.get("Type") == "Video" and stream.get("Height"):
                 height = int(stream["Height"])
+                width = int(stream.get("Width") or 0)
                 fps = stream.get("RealFrameRate") or stream.get("FrameRate")
         paused = bool((sess.get("PlayState") or {}).get("IsPaused"))
-        return height, paused, fps
-    return 0, False, None
+        return height, paused, fps, width
+    return 0, False, None, 0
 
 
 def player_active():
@@ -127,12 +158,25 @@ def set_mode(mode, rate=None):
     if rate:
         args += ["--rate", str(rate)]
     try:
-        stbcommon.as_user(*args, timeout=10)
+        proc = stbcommon.as_user(*args, timeout=10)
     except (OSError, subprocess.SubprocessError):
+        return False
+    if getattr(proc, "returncode", 1) != 0:
+        # Режим не поставился — внутреннее состояние не трогаем, иначе следующие
+        # вызовы решат, что уже переключено.
+        stbcommon.log_to("keys", "режим %s не применился: %s"
+                         % (mode, ((proc.stderr or "").strip()[:120] or "без текста")))
         return False
     _state["mode"] = mode
     _state["last_change"] = time.monotonic()
+    _state["want"] = None          # намерение исполнено, ждать заново не надо
+    _state["want_since"] = 0.0
     stbcommon.log_to("keys", "режим выхода: %s" % mode)
+    try:
+        import stbtabs
+        stbtabs.refit()      # окно браузера иначе остаётся с размером от 4K
+    except Exception:  # noqa: BLE001
+        pass
     return True
 
 
@@ -168,20 +212,41 @@ def to_hd():
     set_mode(MODE_HD, _conf("AUTO_HD_RATE", "60"))
 
 
+# Сколько секунд новое состояние должно продержаться, прежде чем менять режим.
+# Любая смена разрешения останавливает картинку на несколько секунд, поэтому
+# мигание фокуса окна или обрывок опроса не должны её вызывать.
+DWELL = {MODE_4K: 2.0, MODE_HD: 3.0}
+
+
+def _settled(now, goal):
+    """Новое состояние держится достаточно долго?"""
+    if _state.get("want") != goal:
+        _state["want"] = goal
+        _state["want_since"] = now
+        return False
+    return now - _state.get("want_since", now) >= DWELL.get(goal, 3.0)
+
+
 def check():
     """Решение по режиму на текущий момент. Возвращает выбранный режим."""
     mode = video_mode()
+    now = time.monotonic()
     if mode == "off":
-        # Не «не трогать»: при выключенном 4K экран обязан быть в 1080p,
-        # иначе после фильма он так и останется в 2160p.
-        set_mode(MODE_HD, _conf("AUTO_HD_RATE", "60"))
+        # Выключатель: экран обязан быть в 1080p, ждать нечего.
+        if _state.get("mode") != MODE_HD:
+            set_mode(MODE_HD, _conf("AUTO_HD_RATE", "60"))
         return MODE_HD
-    height, paused, fps = playing()
-    if height and player_active() and (mode == "all" or height >= 2000):
+    height, paused, fps, width = playing()
+    big = height >= 2000 or width >= 3000      # широкоформатные 4K: 3840x1600
+    if height and player_active() and (mode == "all" or big):
         if paused and _state["mode"] == MODE_4K:
             return MODE_4K                 # на паузе режим не дёргаем
+        if _state.get("mode") != MODE_4K and not _settled(now, MODE_4K):
+            return _state.get("mode") or MODE_HD    # ещё не время дёргать экран
         set_mode(MODE_4K, _rate(fps) or _conf("AUTO_4K_RATE", "23.98"))
         return MODE_4K
+    if _state.get("mode") == MODE_4K and not _settled(now, MODE_HD):
+        return MODE_4K                     # фильм только что пропал — даём время
     set_mode(MODE_HD, _conf("AUTO_HD_RATE", "60"))
     return MODE_HD
 
@@ -198,18 +263,22 @@ def set_value(value):
             text = text.rstrip("\n") + '\nJMP_VIDEO_4K="%s"\n' % value
         with open(path, "w", encoding="utf-8") as f:
             f.write(text)
-    except OSError:
-        return
+    except OSError as err:
+        stbcommon.log_to("keys", "настройка не записалась: %s" % err)
+        return False
     _state["mode"] = ""
     stbcommon.log_to("keys", "JMP_VIDEO_4K = %s" % value)
     check()
+    return True
 
 
 def toggle():
     """Листнуть режим по кругу: off → auto → all → off."""
     current = video_mode()
     value = VALUES[(VALUES.index(current) + 1) % len(VALUES)]
-    set_value(value)
+    if not set_value(value):
+        toast("настройка не записалась — режим не изменён")
+        return current
     toast({"off": "4K выключен: 1080p",
            "auto": "4K: только 4K-фильмы",
            "all": "4K: все фильмы"}[value])
@@ -230,6 +299,8 @@ def cmd(argv=()):
     if what not in VALUES:
         print("usage: stb mode4k [off|auto|all|toggle|status]", file=sys.stderr)
         return 2
-    set_value(what)
+    if not set_value(what):
+        print("не удалось записать JMP_VIDEO_4K", file=sys.stderr)
+        return 1
     print(what)
     return 0

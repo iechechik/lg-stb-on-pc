@@ -31,8 +31,9 @@ from stbcommon import (STB_HOME, STB_USER, as_user, current_app, key_log,
                        log_to, mark_set, mode_set, say, tv_alive, user_env)
 from stbsvc import cmd_service  # noqa: E402
 import stb4k  # noqa: E402
+import stbscreensaver  # noqa: E402
 from stbdesktop import cmd_login  # noqa: E402
-from stbdesktop import close_splash_now  # noqa: E402
+from stbscreensaver import close_splash_now  # noqa: E402
 from stbdesktop import cmd_browser  # noqa: E402
 from stbdesktop import cmd_box  # noqa: E402
 from stbdesktop import cmd_close  # noqa: E402
@@ -46,7 +47,6 @@ from stbdesktop import cmd_hide  # noqa: E402
 from stbdesktop import cmd_idle  # noqa: E402
 from stbdesktop import cmd_player  # noqa: E402
 from stbdesktop import cmd_screen  # noqa: E402
-from stbdesktop import cmd_screensaver  # noqa: E402
 from stbdesktop import cmd_ui  # noqa: E402
 from stbdesktop import hidden_check  # noqa: E402
 from stbtvcmd import TV_APP, TV_IF, TV_INPUT, cmd_tv, cmd_tv_wake
@@ -140,9 +140,9 @@ def cmd_status(argv):
     """Что сейчас с экраном и плеером: одна строка ответа на каждый вопрос."""
     mode = stb4k.video_mode()
     screen = stb4k.current_mode() or "неизвестно"
-    height, paused, fps = stb4k.playing()
+    height, paused, fps, width = stb4k.playing()
     if height:
-        film = "%dp" % height + (", пауза" if paused else ", играет")
+        film = "%dx%d" % (width, height) + (", пауза" if paused else ", играет")
         if fps:
             film += ", %.3f кадр/с" % float(fps)
     else:
@@ -152,6 +152,14 @@ def cmd_status(argv):
                               "auto": "auto — только 4K-фильм",
                               "all": "all — любой фильм"}[mode])
     print("фильм:      %s" % film)
+    info = stb4k.session_info()
+    if info:
+        how = info.get("method") or "как — неизвестно"
+        if info.get("codec"):
+            how += " → %s" % info["codec"]
+        print("сессия:     %s | %s | %s" % (info.get("device") or "?", info.get("client") or "?", how))
+    else:
+        print("сессия:     нет")
     print("окно Jellyfin: %s" % ("активно" if stb4k.player_active() else "не активно"))
     return 0
 
@@ -876,9 +884,11 @@ HELP = {
     "status": ("что сейчас с экраном и плеером", [
         ("stb status", "разрешение экрана, значение JMP_VIDEO_4K, что играет"),
     ]),
-    "mode4k": ("режим экрана 1080p / 2160p", [
-        ("stb mode4k on | off | toggle | status",
-         "вручную переключить выход: 2160p или 1080p (автопереключение при этом выключается)"),
+    "4k": ("режим экрана 1080p / 2160p", [
+        ("stb 4k", "показать значение и разрешение экрана"),
+        ("stb 4k off | auto | all",
+         "off — всегда 1080p, auto — только 4K-поток, all — любой фильм; алиас команды: mode4k"),
+        ("stb 4k toggle", "листнуть режим по кругу (то же делает синяя кнопка пульта)"),
     ]),
     "sound": ("звук приставки, а не телевизора", [
         ("stb sound on | off", "включить или заглушить звук приставки (на сетке глушится сам)"),
@@ -1043,7 +1053,7 @@ COMMANDS = {
     "player": cmd_player,
     "login": cmd_login,
     "service": cmd_service,
-    "screensaver": cmd_screensaver,
+    "screensaver": stbscreensaver.cmd_screensaver,
     "poweroff": cmd_poweroff,
 }
 def main(argv):

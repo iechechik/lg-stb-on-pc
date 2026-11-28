@@ -128,7 +128,8 @@ else
     OUT="$TARGET"
     NAME="$(basename "$OUT")"
 fi
-tar czf "$OUT" --exclude="*/__pycache__" --exclude="*/.pytest_cache" --exclude="*/.git" -C /opt stb
+tar czf "$OUT" --exclude="*/__pycache__" \
+    --exclude="stb/config/jellyfin.key" --exclude="stb/config/logins.conf" --exclude="*/.pytest_cache" --exclude="*/.git" -C /opt stb
 chmod 644 "$OUT"
 say "   $NAME  $(du -h "$OUT" | cut -f1)  sha256 $(sha256sum "$OUT" | cut -c1-16)…"
 

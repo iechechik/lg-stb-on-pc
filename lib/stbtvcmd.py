@@ -490,16 +490,30 @@ def power_off_tv(timeout=20.0):
     подтвердил выключение.
     """
     key_log("выключение: сначала гашу телевизор")
-    cmd_tv(["off"])
+    sent = cmd_tv(["off"])
+    if sent != 0:
+        key_log("выключение: команда выключения не принята (код %s)" % sent)
     deadline = time.time() + timeout
     state = ""
+    silent_from = 0.0
     while time.time() < deadline:
         time.sleep(0.5)
         state = tv_power_state()
-        if not state or state in SLEEP_STATES:
-            key_log("выключение: телевизор %s" % (state or "не отвечает — считаю выключенным"))
+        if state in SLEEP_STATES:
+            key_log("выключение: телевизор подтвердил ожидание (%s)" % state)
             return True
-    key_log("выключение: телевизор не подтвердил (%s) — выключаюсь всё равно" % (state or "молчит"))
+        if not state:
+            # Пустой ответ — не подтверждение: это может быть и сбой запроса.
+            # Подтверждением считаем только исчезновение из сети после команды.
+            if not silent_from:
+                silent_from = time.time()
+            elif time.time() - silent_from >= 3 and not tv_alive():
+                key_log("выключение: команда принята, телевизор ушёл из сети")
+                return True
+        else:
+            silent_from = 0.0
+    key_log("выключение: подтверждения нет (последнее состояние: %s) — выключаюсь всё равно"
+            % (state or "молчит"))
     return False
 
 

@@ -22,7 +22,7 @@ from stbcommon import STB_USER  # noqa: E402
 from stbtvcmd import TV_INPUT  # noqa: E402
 from stbtvcmd import awake  # noqa: E402
 from stbdesktop import cmd_hide  # noqa: E402
-from stbdesktop import close_splash_now  # noqa: E402
+from stbscreensaver import close_splash_now  # noqa: E402
 from stbtvcmd import cmd_tv  # noqa: E402
 from stbcommon import current_app  # noqa: E402
 from stbdesktop import finish_all  # noqa: E402
@@ -141,10 +141,13 @@ def to_grid():
     except Exception:  # noqa: BLE001
         pass
     try:
+        stbtabs.refit()        # размер страницы после 4K
+    except Exception:  # noqa: BLE001
+        pass
+    try:
         stbtabs.activate_grid()
         placed = stbtabs.select_tile(stbtabs.last_tile())
         window_mode(True)      # сетка всегда во весь экран
-        stbtabs.set_grid_bars(True)
         sink_mute(True)        # на сетке звук всегда выключен
         if not placed:
             # Страница не ответила — ставим указатель по координатам плитки.

@@ -168,6 +168,13 @@ PERIODIC_LOCK_WAIT = 2    # сколько ждём очереди, прежде
 # Бюджеты короче клиентских (8 с в lib/stbtv.py): демон должен успеть сказать
 # «не вышло» раньше, чем клиент решит, что демон мёртв, и полезет напрямую.
 COMMAND_TIMEOUT = 5.0    # секунд на одну команду целиком (очередь + связь + ответ)
+# Снимок экрана — единственная долгая команда: кадр ждём до 15 с, картинку до 10.
+# Общий пятисекундный срок рвал её и уводил демон в переподключение.
+LONG_COMMANDS = {"shot": 25.0}
+
+# Сколько секунд храним приложение телевизора. Дольше — считаем, что неизвестно:
+# по нему сторож решает, гасить панель или выход приставки.
+APP_TTL = 30.0
 
 
 def touch():
@@ -246,6 +253,29 @@ def fetch_image(uri):
         return answer.read()
 
 
+async def current_app(client):
+    """Приложение телевизора. Пусто — «неизвестно», а не «старое, но было».
+
+    По этому значению сторож решает, гасить панель телевизора или выход приставки.
+    Устаревшее значение приводит к неверному решению, поэтому лучше честно
+    сказать «не знаю»: тогда сторож не выбирает вслепую.
+    """
+    now = time.time()
+    updated = STATE.get("app_updated") or 0
+    if STATE.get("app") and now - updated < APP_TTL:
+        return STATE["app"]
+    try:
+        app = await client.get_current_app()
+    except Exception as exc:  # noqa: BLE001
+        log("приложение не опросилось (%s) — считаю неизвестным" % str(exc)[:60])
+        return ""
+    if app:
+        STATE["app"] = app
+        STATE["app_updated"] = now
+        return app
+    return ""
+
+
 async def dispatch(client, cmd, req):
     """Одна команда. Контракт описан в docs/SYSTEM.md, раздел «Протокол stb-tv-link»."""
     if cmd == "state":
@@ -320,7 +350,7 @@ async def dispatch(client, cmd, req):
             return {"ok": False, "msg": "кадр не разобрался: %s" % str(exc)[:60]}
         diff = None if FRAME["sig"] is None else stbdiff.diff_percent(FRAME["sig"], sig)
         FRAME["sig"] = sig
-        app = STATE.get("app") or await client.get_current_app()
+        app = await current_app(client)
         STATE["app"] = app
         return {"ok": True, "app": app, "black": round(black, 1),
                 "diff": None if diff is None else round(diff, 2),
@@ -352,7 +382,8 @@ async def handle(req):
     сдавался и повторял нажатие, пока демон ещё работал.
     """
     cmd = (req or {}).get("cmd", "")
-    deadline = time.monotonic() + COMMAND_TIMEOUT
+    budget = LONG_COMMANDS.get(cmd, COMMAND_TIMEOUT)
+    deadline = time.monotonic() + budget
 
     def left():
         """Сколько осталось от общего срока; ноль и меньше — срок вышел."""
@@ -361,7 +392,7 @@ async def handle(req):
     try:
         await asyncio.wait_for(_lock.acquire(), timeout=left())
     except asyncio.TimeoutError:
-        log("команда %s не дождалась очереди за %.0f с" % (cmd, COMMAND_TIMEOUT))
+        log("команда %s не дождалась очереди за %.0f с" % (cmd, budget))
         return {"ok": False, "msg": "демон занят другой командой"}
     try:
         if _client is None or not _client.is_connected():

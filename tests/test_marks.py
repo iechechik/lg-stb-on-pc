@@ -13,7 +13,7 @@ import sys
 import pytest
 
 import stbcommon
-import stbdesktop
+import stbscreensaver
 
 ROOT = os.environ.get("STB_ROOT", "/opt/stb")
 sys.path.insert(0, os.path.join(ROOT, "lib"))
@@ -33,15 +33,15 @@ def test_markers_roundtrip(cli, tmp_path):
     """Отметка ставится, читается, снимается; возраст считается."""
     path = str(tmp_path / "mark")
     assert stbcommon.mark_read(path, "нет") == "нет"
-    assert stbdesktop.mark_age(path) is None
+    assert stbscreensaver.mark_age(path) is None
 
     assert stbcommon.mark_set(path, "значение") is True
     assert stbcommon.mark_read(path) == "значение"
-    assert stbdesktop.mark_age(path) == 0
+    assert stbscreensaver.mark_age(path) == 0
 
     stbcommon.mark_clear(path)
     assert stbcommon.mark_read(path, "нет") == "нет"
-    assert stbdesktop.mark_age(path) is None
+    assert stbscreensaver.mark_age(path) is None
 
 
 def test_mark_clear_tolerates_missing(cli, tmp_path):
