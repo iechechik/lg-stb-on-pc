@@ -16,10 +16,25 @@ CONFIG = os.environ.get("STB_CONFIG", os.path.join(CONFIG_DIR, "stb.conf"))
 
 
 def _clean(line):
-    """Убирает комментарий в конце строки, не трогая кавычки."""
+    """Убирает комментарий, не трогая кавычки и экранированные символы.
+
+    «#» вне кавычек начинает комментарий, «\\#» — это сам символ решётки, так
+    что пароль или адрес с «#» можно писать без кавычек.
+    """
     out = []
     quote = None
-    for ch in line:
+    i = 0
+    while i < len(line):
+        ch = line[i]
+        if ch == "\\" and i + 1 < len(line):
+            nxt = line[i + 1]
+            if nxt in "#\\\"'":
+                out.append(nxt)
+                i += 2
+                continue
+            out.append(ch)
+            i += 1
+            continue
         if quote:
             out.append(ch)
             if ch == quote:
@@ -31,7 +46,25 @@ def _clean(line):
             break
         else:
             out.append(ch)
-    return "".join(out).strip()
+        i += 1
+    return "".join(out)
+
+
+def parse_line(raw):
+    """(ключ, значение) из строки «КЛЮЧ=значение»; None — пусто, комментарий, мусор.
+
+    Единый разбор для всех конфигов проекта. Комментарий «#» отрезается только
+    вне кавычек, поэтому значение вида "http://host/#frag" не портится, а
+    "BLUE=blue  # синяя" по-прежнему даёт действие "blue".
+    """
+    line = _clean(raw).strip()
+    if not line or "=" not in line:
+        return None
+    key, value = line.split("=", 1)
+    key, value = key.strip(), value.strip()
+    if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+        value = value[1:-1]
+    return (key, value) if key else None
 
 
 def load(path=None):
@@ -41,16 +74,9 @@ def load(path=None):
     try:
         with open(path, encoding="utf-8") as f:
             for raw in f:
-                line = _clean(raw)
-                if not line or "=" not in line:
-                    continue
-                key, value = line.split("=", 1)
-                key = key.strip()
-                value = value.strip()
-                if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
-                    value = value[1:-1]
-                if key:
-                    data[key] = value
+                pair = parse_line(raw)
+                if pair:
+                    data[pair[0]] = pair[1]
     except OSError:
         pass
     return data

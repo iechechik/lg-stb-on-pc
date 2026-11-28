@@ -412,11 +412,10 @@ def bt_keys_apply(dry_run=False):
     body = ["# Собрано из %s — правьте карту, а не этот файл." % maps,
             "# Применить: stb keys apply bt", ""]
     for raw in open(maps, encoding="utf-8"):
-        line = raw.strip()
-        if not line or line.startswith("#") or "=" not in line:
+        pair = stbconf.parse_line(raw)
+        if not pair:
             continue
-        key, action = line.split("=", 1)
-        key, action = key.replace(" ", ""), action.split("#")[0].strip()
+        key, action = pair[0].replace(" ", ""), pair[1]
         if not key or not action:
             continue
         body += ['"/opt/stb/bin/stb key %s"' % action, "    %s" % key, ""]

@@ -567,11 +567,11 @@ def login_entry(tile_id):
     try:
         with open(path, encoding="utf-8") as f:
             for raw in f:
-                line = raw.split("#", 1)[0].strip()
-                if "=" not in line:
+                pair = stbconf.parse_line(raw)
+                if not pair:
                     continue
-                key, value = line.split("=", 1)
-                if key.strip().lower() != (tile_id or "").strip().lower():
+                key, value = pair
+                if key.lower() != (tile_id or "").strip().lower():
                     continue
                 parts = [p.strip() for p in value.split(":")]
                 if len(parts) < 2:

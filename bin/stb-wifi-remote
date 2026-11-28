@@ -72,14 +72,10 @@ def load_keymap():
     try:
         with open(path, encoding="utf-8") as f:
             for raw in f:
-                line = raw.strip()
-                if not line or line.startswith("#") or "=" not in line:
+                pair = stbconf.parse_line(raw)
+                if not pair:
                     continue
-                name, action = line.split("=", 1)
-                name = name.strip().upper()
-                action = action.strip()
-                if name and action:
-                    table[name] = action
+                table[pair[0].upper()] = pair[1]
     except OSError as exc:
         w(f"карта кнопок не прочитана ({path}): {exc} — работаю по пустой")
     return table
